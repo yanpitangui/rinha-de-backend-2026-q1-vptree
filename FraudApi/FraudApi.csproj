@@ -7,8 +7,8 @@
         <PublishAot>true</PublishAot>
         <InvariantGlobalization>true</InvariantGlobalization>
 
-        <!-- AOT codegen: target Haswell (AVX2, FMA, BMI1/2, POPCNT, F16C). -->
-        <IlcInstructionSet>avx2</IlcInstructionSet>
+        <!-- AOT codegen: target AVX2 on x64; ARM64 defaults to NEON. -->
+        <IlcInstructionSet Condition="$(RuntimeIdentifier.Contains('x64'))">avx2</IlcInstructionSet>
         <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
         <OptimizationPreference>Speed</OptimizationPreference>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

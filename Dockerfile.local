@@ -1,5 +1,5 @@
 FROM mcr.microsoft.com/dotnet/sdk:11.0-preview-alpine AS builder
-RUN apk add --no-cache clang zlib-dev musl-dev
+RUN apk add --no-cache clang zlib-dev musl-dev build-base
 WORKDIR /src
 
 COPY FraudApi/FraudApi.csproj FraudApi/
@@ -10,12 +10,12 @@ RUN dotnet restore FraudApi/FraudApi.csproj -r linux-musl-arm64
 COPY . .
 
 WORKDIR /src/FraudApi.PreProcessor
-RUN dotnet publish -c Release -o /app/preprocessor
+RUN dotnet publish -c Release -r linux-musl-arm64 --self-contained true /p:PublishAot=true -o /app/preprocessor
 
 RUN /app/preprocessor/FraudApi.PreProcessor /src/resources
 
 WORKDIR /src/FraudApi
-RUN dotnet publish FraudApi.csproj -c Release -r linux-musl-arm64 --self-contained true /p:PublishAot=false -o /app/publish
+RUN dotnet publish FraudApi.csproj -c Release -r linux-musl-arm64 --self-contained true /p:PublishAot=true -o /app/publish
 
 FROM mcr.microsoft.com/dotnet/runtime-deps:11.0-preview-alpine
 WORKDIR /appa

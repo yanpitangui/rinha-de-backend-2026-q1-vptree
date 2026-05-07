@@ -138,6 +138,7 @@ public unsafe class SearchEngine
     {
         fixed (int* dptr = dist)
         {
+#if TARGET_X64
             if (Avx2.IsSupported)
             {
                 var qVec = Vector256.Create((int)q);
@@ -155,7 +156,8 @@ public unsafe class SearchEngine
                 }
                 return;
             }
-
+#endif
+#if TARGET_ARM64
             if (AdvSimd.IsSupported)
             {
                 var qVec = Vector128.Create((int)q);
@@ -173,7 +175,7 @@ public unsafe class SearchEngine
                 }
                 return;
             }
-
+#endif
             for (int i = 0; i < 64; i++)
             {
                 int d = data[i] - q;
