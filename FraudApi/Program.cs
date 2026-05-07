@@ -6,6 +6,19 @@ using FraudApi.FraudDetection;
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.AddServerHeader = false;
+    options.Limits.MaxRequestBodySize = 4096;
+
+    var socketPath = $"/sockets/{System.Net.Dns.GetHostName()}.sock";
+    if (Directory.Exists("/sockets"))
+    {
+        if (File.Exists(socketPath)) File.Delete(socketPath);
+        options.ListenUnixSocket(socketPath);
+    }
+});
+
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
@@ -16,19 +29,19 @@ var resourcesPath = Environment.GetEnvironmentVariable("RESOURCES_PATH")
 
 var mccRaw = JsonSerializer.Deserialize(
     File.ReadAllText(Path.Combine(resourcesPath, "mcc_risk.json")),
-    AppJsonSerializerContext.Default.DictionaryStringSingle
+    AppJsonSerializerContext.Default.DictionaryStringDouble
 )!;
 
-var mccRisk = new Dictionary<int, float>(mccRaw.Count);
+var mccRisk = new Dictionary<int, double>(mccRaw.Count);
 foreach (var kv in mccRaw)
-{
-    mccRisk[int.Parse((string)kv.Key)] = kv.Value;
-}
+    mccRisk[int.Parse(kv.Key)] = kv.Value;
 
 var normalization = JsonSerializer.Deserialize(
     File.ReadAllText(Path.Combine(resourcesPath, "normalization.json")),
     AppJsonSerializerContext.Default.NormalizationConfig
 )!;
+
+var nprobe = int.TryParse(Environment.GetEnvironmentVariable("NPROBE"), out var np) ? np : 16;
 
 unsafe
 {
@@ -37,7 +50,11 @@ unsafe
     FraudHandler.Engine = new SearchEngine(
         mmap.Blocks,
         mmap.Labels,
-        mmap.BlockCount
+        mmap.Centroids,
+        mmap.ClusterBlockStart,
+        mmap.ClusterBlockLen,
+        mmap.K,
+        nprobe
     );
 }
 
@@ -51,6 +68,17 @@ var app = builder.Build();
 app.MapGet("/ready", () => Results.Ok());
 
 app.MapPost("/fraud-score", FraudHandler.Handle);
+
+// chmod the socket so nginx can access it
+var socketPath = $"/sockets/{System.Net.Dns.GetHostName()}.sock";
+if (Directory.Exists("/sockets"))
+{
+    _ = Task.Run(async () =>
+    {
+        while (!File.Exists(socketPath)) await Task.Delay(50);
+        System.Diagnostics.Process.Start("chmod", $"777 {socketPath}")?.WaitForExit();
+    });
+}
 
 app.Run();
 
@@ -70,7 +98,7 @@ static byte[][] BuildResponses()
 
 [JsonSerializable(typeof(FraudRequest))]
 [JsonSerializable(typeof(NormalizationConfig))]
-[JsonSerializable(typeof(Dictionary<string, float>))]
+[JsonSerializable(typeof(Dictionary<string, double>))]
 internal partial class AppJsonSerializerContext : JsonSerializerContext
 {
 }

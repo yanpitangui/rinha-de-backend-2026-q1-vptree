@@ -1,27 +1,27 @@
-﻿namespace FraudApi.Config;
+namespace FraudApi.Config;
 
 using System.Text.Json.Serialization;
 
 public sealed class NormalizationConfig
 {
     [JsonPropertyName("max_amount")]
-    public float MaxAmount { get; set; }
+    public double MaxAmount { get; set; }
 
     [JsonPropertyName("max_installments")]
-    public float MaxInstallments { get; set; }
+    public double MaxInstallments { get; set; }
 
     [JsonPropertyName("amount_vs_avg_ratio")]
-    public float AmountVsAvgRatio { get; set; }
+    public double AmountVsAvgRatio { get; set; }
 
     [JsonPropertyName("max_minutes")]
-    public float MaxMinutes { get; set; }
+    public double MaxMinutes { get; set; }
 
     [JsonPropertyName("max_km")]
-    public float MaxKm { get; set; }
+    public double MaxKm { get; set; }
 
     [JsonPropertyName("max_tx_count_24h")]
-    public float MaxTxCount24h { get; set; }
+    public double MaxTxCount24h { get; set; }
 
     [JsonPropertyName("max_merchant_avg_amount")]
-    public float MaxMerchantAvgAmount { get; set; }
+    public double MaxMerchantAvgAmount { get; set; }
 }

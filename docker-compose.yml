@@ -1,0 +1,63 @@
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - uds-sockets:/sockets
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "30MB"
+
+  api1:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    hostname: api1
+    environment:
+      - NPROBE=${NPROBE:-16}
+    volumes:
+      - uds-sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /sockets/api1.sock"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+
+  api2:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    hostname: api2
+    environment:
+      - NPROBE=${NPROBE:-16}
+    volumes:
+      - uds-sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /sockets/api2.sock"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+
+volumes:
+  uds-sockets:

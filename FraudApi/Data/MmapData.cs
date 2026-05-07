@@ -1,4 +1,4 @@
-﻿using FraudApi.Shared;
+using FraudApi.Shared;
 
 namespace FraudApi.Data;
 
@@ -10,9 +10,13 @@ public sealed unsafe class MmapData
     public byte* Labels;
     public int BlockCount;
     public int Total;
+    public int K;
+    public float[] Centroids = null!;
+    public int[] ClusterBlockStart = null!;
+    public int[] ClusterBlockLen = null!;
 
-    private MemoryMappedFile _mmf;
-    private MemoryMappedViewAccessor _accessor;
+    private MemoryMappedFile _mmf = null!;
+    private MemoryMappedViewAccessor _accessor = null!;
 
     public static MmapData Load(string path)
     {
@@ -22,13 +26,30 @@ public sealed unsafe class MmapData
         byte* ptr = null;
         accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
 
-        int blockCount = *(int*)ptr;
-        int total = *(int*)(ptr + 4);
+        // IVF2 header: Magic(4) BlockCount(4) Total(4) K(4)
+        int blockCount = *(int*)(ptr + 4);
+        int total      = *(int*)(ptr + 8);
+        int k          = *(int*)(ptr + 12);
 
-        byte* dataStart = ptr + 8;
+        // Centroids: K * 16 floats
+        float* centroidPtr = (float*)(ptr + 16);
+        var centroids = new float[k * 16];
+        new ReadOnlySpan<float>(centroidPtr, k * 16).CopyTo(centroids);
 
+        // ClusterBlockStart: K ints
+        int* blockStartPtr = (int*)(centroidPtr + k * 16);
+        var clusterBlockStart = new int[k];
+        new ReadOnlySpan<int>(blockStartPtr, k).CopyTo(clusterBlockStart);
+
+        // ClusterBlockLen: K ints
+        int* blockLenPtr = blockStartPtr + k;
+        var clusterBlockLen = new int[k];
+        new ReadOnlySpan<int>(blockLenPtr, k).CopyTo(clusterBlockLen);
+
+        // Blocks then labels
+        byte* dataStart = (byte*)(blockLenPtr + k);
         var blocks = (Block*)dataStart;
-        var labels = dataStart + sizeof(Block) * blockCount;
+        var labels = dataStart + (long)sizeof(Block) * blockCount;
 
         return new MmapData
         {
@@ -36,6 +57,10 @@ public sealed unsafe class MmapData
             Labels = labels,
             BlockCount = blockCount,
             Total = total,
+            K = k,
+            Centroids = centroids,
+            ClusterBlockStart = clusterBlockStart,
+            ClusterBlockLen = clusterBlockLen,
             _mmf = mmf,
             _accessor = accessor
         };
