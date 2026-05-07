@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net11.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <PublishAot>true</PublishAot>
+        <InvariantGlobalization>true</InvariantGlobalization>
+
+        <!-- AOT codegen: target Haswell (AVX2, FMA, BMI1/2, POPCNT, F16C). -->
+        <IlcInstructionSet>avx2</IlcInstructionSet>
+        <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
+        <OptimizationPreference>Speed</OptimizationPreference>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+
+        <!-- Runtime tuning -->
+        <TieredCompilation>false</TieredCompilation>
+        <ServerGarbageCollection>true</ServerGarbageCollection>
+        <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+
+        <!-- Strip unused metadata for smaller / faster binary -->
+        <DebuggerSupport>false</DebuggerSupport>
+        <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
+        <EventSourceSupport>false</EventSourceSupport>
+        <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
+        <MetricsSupport>false</MetricsSupport>
+        <StackTraceSupport>false</StackTraceSupport>
+        <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\FraudApi.Shared\FraudApi.Shared.csproj" />
+    </ItemGroup>
+
+</Project>

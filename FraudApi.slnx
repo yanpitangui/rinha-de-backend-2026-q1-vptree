@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/Solution Folder/">
+    <File Path=".gitignore" />
+  </Folder>
+  <Project Path="FraudApi.PreProcessor/FraudApi.PreProcessor.csproj" />
+  <Project Path="FraudApi.Shared/FraudApi.Shared.csproj" />
+  <Project Path="FraudApi/FraudApi.csproj" />
+</Solution>
