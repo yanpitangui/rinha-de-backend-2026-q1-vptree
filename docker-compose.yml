@@ -18,9 +18,7 @@ services:
           memory: "30MB"
 
   api1:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:latest
     hostname: api1
     security_opt:
       - seccomp:unconfined
@@ -41,9 +39,7 @@ services:
           memory: "160MB"
 
   api2:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:latest
     hostname: api2
     security_opt:
       - seccomp:unconfined
