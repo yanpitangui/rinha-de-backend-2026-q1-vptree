@@ -31,14 +31,15 @@ public unsafe class SearchEngine
 
     public int Search(Span<short> query)
     {
-        // Step 1: find the nprobe nearest centroids
         Span<int> probeIdx = stackalloc int[_nprobe];
-        FindTopClusters(query, probeIdx);
+        Span<float> probeDists = stackalloc float[_nprobe];
+        FindTopClusters(query, probeIdx, probeDists);
+        SortProbes(probeIdx, probeDists);
 
-        // Step 2: scan selected cluster blocks, maintain global top-5
         Span<int> best = stackalloc int[5];
         Span<byte> bestLabels = stackalloc byte[5];
         best.Fill(int.MaxValue);
+        int bound = int.MaxValue;
         Span<int> dist = stackalloc int[64];
 
         fixed (short* qPtr = query)
@@ -65,7 +66,7 @@ public unsafe class SearchEngine
                     ProcessDim(block->D11, qPtr[11], dist);
                     ProcessDim(block->D12, qPtr[12], dist);
                     ProcessDim(block->D13, qPtr[13], dist);
-                    UpdateTopK(dist, best, bestLabels, b * 64);
+                    bound = UpdateTopK(dist, best, bestLabels, b * 64, bound);
                 }
             }
         }
@@ -75,9 +76,8 @@ public unsafe class SearchEngine
         return count;
     }
 
-    private void FindTopClusters(Span<short> query, Span<int> probeIdx)
+    private void FindTopClusters(Span<short> query, Span<int> probeIdx, Span<float> probeDists)
     {
-        // L2 distance from query to every centroid (K=256 floats on stack = 1 KB)
         Span<float> dists = stackalloc float[_k];
         fixed (float* cPtr = _centroids)
         {
@@ -94,8 +94,6 @@ public unsafe class SearchEngine
             }
         }
 
-        // Pick nprobe smallest by linear scan (K=256 is tiny)
-        Span<float> probeDists = stackalloc float[_nprobe];
         probeDists.Fill(float.MaxValue);
         probeIdx.Fill(0);
 
@@ -116,22 +114,45 @@ public unsafe class SearchEngine
         }
     }
 
-    private unsafe void UpdateTopK(Span<int> dist, Span<int> best, Span<byte> bestLabels, int labelBase)
+    // Insertion sort — nprobe is small (default 16)
+    private static void SortProbes(Span<int> idx, Span<float> dists)
+    {
+        for (int i = 1; i < idx.Length; i++)
+        {
+            float d = dists[i];
+            int id = idx[i];
+            int j = i - 1;
+            while (j >= 0 && dists[j] > d)
+            {
+                dists[j + 1] = dists[j];
+                idx[j + 1] = idx[j];
+                j--;
+            }
+            dists[j + 1] = d;
+            idx[j + 1] = id;
+        }
+    }
+
+    private unsafe int UpdateTopK(Span<int> dist, Span<int> best, Span<byte> bestLabels, int labelBase, int bound)
     {
         for (int i = 0; i < 64; i++)
         {
             int d = dist[i];
-            int maxIdx = 0, maxVal = best[0];
-            for (int j = 1; j < 5; j++)
+            if (d >= bound) continue;
+
+            // Sorted insertion: maintain best[] ascending so best[4] is always the tightest bound
+            int pos = 3;
+            while (pos >= 0 && best[pos] > d)
             {
-                if (best[j] > maxVal) { maxVal = best[j]; maxIdx = j; }
+                best[pos + 1] = best[pos];
+                bestLabels[pos + 1] = bestLabels[pos];
+                pos--;
             }
-            if (d < maxVal)
-            {
-                best[maxIdx] = d;
-                bestLabels[maxIdx] = _labels[labelBase + i];
-            }
+            best[pos + 1] = d;
+            bestLabels[pos + 1] = _labels[labelBase + i];
+            bound = best[4];
         }
+        return bound;
     }
 
     private static unsafe void ProcessDim(short* data, short q, Span<int> dist)
