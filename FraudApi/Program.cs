@@ -10,6 +10,8 @@ builder.WebHost.ConfigureKestrel(options =>
 {
     options.AddServerHeader = false;
     options.Limits.MaxRequestBodySize = 4096;
+    options.Limits.MaxConcurrentConnections = 2048;
+    options.Limits.MaxConcurrentUpgradedConnections = 1024;
 
     var socketPath = $"/sockets/{System.Net.Dns.GetHostName()}.sock";
     if (Directory.Exists("/sockets"))
