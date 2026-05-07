@@ -22,6 +22,8 @@ services:
       context: .
       dockerfile: Dockerfile.local
     hostname: api1
+    security_opt:
+      - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-16}
     volumes:
@@ -43,6 +45,8 @@ services:
       context: .
       dockerfile: Dockerfile.local
     hostname: api2
+    security_opt:
+      - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-16}
     volumes:
