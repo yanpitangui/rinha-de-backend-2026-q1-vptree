@@ -125,9 +125,12 @@ public unsafe class SearchEngine
             // Skip cluster if its bbox is provably farther than current best
             if (bound < int.MaxValue && BboxExceedsOrEquals(query, ci, bound)) continue;
 
-            int bEnd = _clusterBlockStart[ci] + _clusterBlockLen[ci];
-            for (int b = _clusterBlockStart[ci]; b < bEnd; b++)
+            int bStart = _clusterBlockStart[ci];
+            int bEnd   = bStart + _clusterBlockLen[ci];
+            for (int b = bStart; b < bEnd; b++)
             {
+                if (Sse.IsSupported && b + 3 < bEnd)
+                    Sse.Prefetch0(_blocks + b + 3);
                 ProcessAllDims(_blocks + b, qPtr, dist);
                 bound = UpdateTopK(dist, best, bestLabels, b * 64, bound);
             }
@@ -253,23 +256,99 @@ public unsafe class SearchEngine
 #if TARGET_X64
             if (Avx2.IsSupported)
             {
+                // Hoist query broadcasts outside chunk loop — 14 vpbroadcastd instead of 56
+                var qv0  = Vector256.Create((int)q[0]);
+                var qv1  = Vector256.Create((int)q[1]);
+                var qv2  = Vector256.Create((int)q[2]);
+                var qv3  = Vector256.Create((int)q[3]);
+                var qv4  = Vector256.Create((int)q[4]);
+                var qv5  = Vector256.Create((int)q[5]);
+                var qv6  = Vector256.Create((int)q[6]);
+                var qv7  = Vector256.Create((int)q[7]);
+                var qv8  = Vector256.Create((int)q[8]);
+                var qv9  = Vector256.Create((int)q[9]);
+                var qv10 = Vector256.Create((int)q[10]);
+                var qv11 = Vector256.Create((int)q[11]);
+                var qv12 = Vector256.Create((int)q[12]);
+                var qv13 = Vector256.Create((int)q[13]);
+
                 for (int chunk = 0; chunk < 4; chunk++)
                 {
                     int vBase = chunk * 16;
                     var acc_lo = Vector256<int>.Zero;
                     var acc_hi = Vector256<int>.Zero;
+                    Vector256<short> v;
+                    Vector256<int> lo, hi, dlo, dhi;
 
-                    for (int d = 0; d < 14; d++)
-                    {
-                        var qd = Vector256.Create((int)q[d]);
-                        var v  = Avx.LoadVector256(blockBase + d * 64 + vBase);
-                        var lo = Avx2.ConvertToVector256Int32(v.GetLower());
-                        var hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                        var dlo = Avx2.Subtract(lo, qd);
-                        var dhi = Avx2.Subtract(hi, qd);
-                        acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo));
-                        acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-                    }
+                    v = Avx.LoadVector256(blockBase + 0 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv0); dhi = Avx2.Subtract(hi, qv0);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 1 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv1); dhi = Avx2.Subtract(hi, qv1);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 2 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv2); dhi = Avx2.Subtract(hi, qv2);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 3 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv3); dhi = Avx2.Subtract(hi, qv3);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 4 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv4); dhi = Avx2.Subtract(hi, qv4);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 5 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv5); dhi = Avx2.Subtract(hi, qv5);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 6 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv6); dhi = Avx2.Subtract(hi, qv6);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 7 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv7); dhi = Avx2.Subtract(hi, qv7);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 8 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv8); dhi = Avx2.Subtract(hi, qv8);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 9 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv9); dhi = Avx2.Subtract(hi, qv9);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 10 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv10); dhi = Avx2.Subtract(hi, qv10);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 11 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv11); dhi = Avx2.Subtract(hi, qv11);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 12 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv12); dhi = Avx2.Subtract(hi, qv12);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+
+                    v = Avx.LoadVector256(blockBase + 13 * 64 + vBase);
+                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                    dlo = Avx2.Subtract(lo, qv13); dhi = Avx2.Subtract(hi, qv13);
+                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
 
                     Avx.Store(dptr + vBase,     acc_lo);
                     Avx.Store(dptr + vBase + 8, acc_hi);
