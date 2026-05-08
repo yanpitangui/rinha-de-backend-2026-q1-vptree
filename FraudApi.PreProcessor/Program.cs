@@ -94,61 +94,14 @@ Console.WriteLine($"Loaded {total} vectors. Running k-means (K={K})...");
 
 // ── Phase 2: k-means++ on a sample ───────────────────────────────────────
 var rng = new Random(42);
-
-// Reservoir-sample SampleSize indices
 var sampleIdx = ReservoirSample(total, SampleSize, rng);
-
-// K-means++ init
-var centroids = KMeansPlusPlusInit(allVecs, sampleIdx, K, rng); // float[K * 16]
-
-// K-means iterations
-int[] tempAssign = new int[SampleSize];
-var newCentroids = new float[K * 16];
-var counts = new int[K];
-
-for (int iter = 0; iter < KMeansIter; iter++)
-{
-    // Assign sample
-    for (int si = 0; si < SampleSize; si++)
-        tempAssign[si] = NearestCentroid(allVecs, sampleIdx[si] * 16, centroids);
-
-    // Recompute centroids
-    Array.Clear(newCentroids);
-    Array.Clear(counts);
-    for (int si = 0; si < SampleSize; si++)
-    {
-        int ck = tempAssign[si];
-        int vb = sampleIdx[si] * 16;
-        for (int d = 0; d < Dims; d++)
-            newCentroids[ck * 16 + d] += allVecs[vb + d];
-        counts[ck]++;
-    }
-    for (int ck = 0; ck < K; ck++)
-    {
-        if (counts[ck] == 0) continue;
-        for (int d = 0; d < Dims; d++)
-            newCentroids[ck * 16 + d] /= counts[ck];
-    }
-    // Handle empty clusters: re-init from random sample
-    for (int ck = 0; ck < K; ck++)
-    {
-        if (counts[ck] == 0)
-        {
-            int fallback = sampleIdx[rng.Next(SampleSize)] * 16;
-            for (int d = 0; d < Dims; d++)
-                newCentroids[ck * 16 + d] = allVecs[fallback + d];
-        }
-    }
-    Array.Copy(newCentroids, centroids, K * 16);
-
-    if ((iter + 1) % 5 == 0) Console.WriteLine($"  iter {iter+1}/{KMeansIter}");
-}
+var centroids = RunKMeans(allVecs, sampleIdx, K, KMeansIter, "mixed", rng);
 
 // ── Phase 3: assign all vectors to clusters ───────────────────────────────
 Console.WriteLine("Assigning all vectors to clusters...");
 var assignments = new int[total];
-for (int i = 0; i < total; i++)
-    assignments[i] = NearestCentroid(allVecs, i * 16, centroids);
+Parallel.For(0, total, i =>
+    assignments[i] = NearestCentroidInRange(allVecs, i * 16, centroids, 0, K));
 
 // ── Phase 4: group by cluster ─────────────────────────────────────────────
 var clusterMembers = new List<int>[K];
@@ -271,12 +224,13 @@ static float[] KMeansPlusPlusInit(short[] vecs, int[] sample, int k, Random rng)
 
     for (int ci = 1; ci < k; ci++)
     {
-        // Update min distances to nearest centroid
-        for (int si = 0; si < sample.Length; si++)
+        // Update min distances — each si writes only minDist[si], safe to parallelize
+        int prevCBase = (ci - 1) * 16;
+        Parallel.For(0, sample.Length, si =>
         {
-            float d = CentroidDist(vecs, sample[si] * 16, centroids, (ci - 1) * 16);
+            float d = CentroidDist(vecs, sample[si] * 16, centroids, prevCBase);
             if (d < minDist[si]) minDist[si] = d;
-        }
+        });
         // Pick next centroid with probability proportional to minDist^2
         float total = 0;
         for (int si = 0; si < sample.Length; si++) total += minDist[si];
@@ -306,16 +260,75 @@ static float CentroidDist(short[] vecs, int vBase, float[] centroids, int cBase)
     return dist;
 }
 
-static int NearestCentroid(short[] vecs, int vBase, float[] centroids)
+// Search only centroids [start..start+count) — returns index relative to start
+static int NearestCentroidInRange(short[] vecs, int vBase, float[] centroids, int start, int count)
 {
     int best = 0;
     float bestDist = float.MaxValue;
-    for (int k = 0; k < K; k++)
+    for (int i = 0; i < count; i++)
     {
-        float dist = CentroidDist(vecs, vBase, centroids, k * 16);
-        if (dist < bestDist) { bestDist = dist; best = k; }
+        float dist = CentroidDist(vecs, vBase, centroids, (start + i) * 16);
+        if (dist < bestDist) { bestDist = dist; best = i; }
     }
     return best;
+}
+
+static float[] RunKMeans(short[] vecs, int[] sampleIdx, int k, int iters, string label, Random rng)
+{
+    Console.WriteLine($"  K-means {label}: k={k}, sample={sampleIdx.Length}");
+    var centroids = KMeansPlusPlusInit(vecs, sampleIdx, k, rng);
+    var tempAssign = new int[sampleIdx.Length];
+    var newCentroids = new float[k * 16];
+    var counts = new int[k];
+
+    for (int iter = 0; iter < iters; iter++)
+    {
+        // Parallel assignment
+        Parallel.For(0, sampleIdx.Length, si =>
+            tempAssign[si] = NearestCentroidInRange(vecs, sampleIdx[si] * 16, centroids, 0, k));
+
+        // Parallel accumulation with thread-local buffers merged at end
+        Array.Clear(newCentroids);
+        Array.Clear(counts);
+        Parallel.For(0, sampleIdx.Length,
+            () => (Acc: new float[k * 16], Cnt: new int[k]),
+            (si, _, local) =>
+            {
+                int ck = tempAssign[si];
+                int vb = sampleIdx[si] * 16;
+                for (int d = 0; d < Dims; d++)
+                    local.Acc[ck * 16 + d] += vecs[vb + d];
+                local.Cnt[ck]++;
+                return local;
+            },
+            local =>
+            {
+                lock (newCentroids)
+                {
+                    for (int i = 0; i < k * 16; i++) newCentroids[i] += local.Acc[i];
+                    for (int i = 0; i < k; i++) counts[i] += local.Cnt[i];
+                }
+            });
+
+        for (int ck = 0; ck < k; ck++)
+        {
+            if (counts[ck] == 0) continue;
+            for (int d = 0; d < Dims; d++)
+                newCentroids[ck * 16 + d] /= counts[ck];
+        }
+        for (int ck = 0; ck < k; ck++)
+        {
+            if (counts[ck] == 0)
+            {
+                int fallback = sampleIdx[rng.Next(sampleIdx.Length)] * 16;
+                for (int d = 0; d < Dims; d++)
+                    newCentroids[ck * 16 + d] = vecs[fallback + d];
+            }
+        }
+        Array.Copy(newCentroids, centroids, k * 16);
+        if ((iter + 1) % 5 == 0) Console.WriteLine($"    {label} iter {iter+1}/{iters}");
+    }
+    return centroids;
 }
 
 static unsafe void WriteBlock(BinaryWriter bw, short[] vecs, List<int> members, int start, int realCount)

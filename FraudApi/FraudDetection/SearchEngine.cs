@@ -133,7 +133,7 @@ public unsafe class SearchEngine
             int hi = _bboxMax[bboxBase + d];
             if (q < lo) { int diff = lo - q; lb += diff * diff; }
             else if (q > hi) { int diff = q - hi; lb += diff * diff; }
-            if (lb >= bound) return true;
+            if (lb > bound) return true;
         }
         return false;
     }
@@ -212,7 +212,7 @@ public unsafe class SearchEngine
         for (int i = 0; i < 64; i++)
         {
             int d = dist[i];
-            if (d >= bound) continue;
+            if (d > bound) continue;
 
             int pos = 3;
             while (pos >= 0 && best[pos] > d)
