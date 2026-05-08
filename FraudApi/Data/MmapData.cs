@@ -7,6 +7,8 @@ public sealed unsafe class MmapData
 {
     public Block* Blocks;
     public byte* Labels;
+    public short* BboxMin; // K * 14 shorts
+    public short* BboxMax; // K * 14 shorts
     public int BlockCount;
     public int Total;
     public int K;
@@ -18,9 +20,10 @@ public sealed unsafe class MmapData
 
     public static MmapData Load(string path)
     {
-        var raw = File.ReadAllBytes(path);
-        var data = GC.AllocateUninitializedArray<byte>(raw.Length, pinned: true);
-        raw.AsSpan().CopyTo(data);
+        var fileSize = (int)new FileInfo(path).Length;
+        var data = GC.AllocateUninitializedArray<byte>(fileSize, pinned: true);
+        using var fs = File.OpenRead(path);
+        fs.ReadExactly(data);
 
         fixed (byte* ptr = &MemoryMarshal.GetArrayDataReference(data))
         {
@@ -40,7 +43,10 @@ public sealed unsafe class MmapData
             var clusterBlockLen = new int[k];
             new ReadOnlySpan<int>(blockLenPtr, k).CopyTo(clusterBlockLen);
 
-            byte* dataStart = (byte*)(blockLenPtr + k);
+            short* bboxMinPtr = (short*)(blockLenPtr + k);
+            short* bboxMaxPtr = bboxMinPtr + k * 14;
+
+            byte* dataStart = (byte*)(bboxMaxPtr + k * 14);
             var blocks = (Block*)dataStart;
             var labels = dataStart + (long)sizeof(Block) * blockCount;
 
@@ -48,6 +54,8 @@ public sealed unsafe class MmapData
             {
                 Blocks = blocks,
                 Labels = labels,
+                BboxMin = bboxMinPtr,
+                BboxMax = bboxMaxPtr,
                 BlockCount = blockCount,
                 Total = total,
                 K = k,

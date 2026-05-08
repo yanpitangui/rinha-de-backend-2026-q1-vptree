@@ -5,9 +5,9 @@ using FraudApi.Shared;
 const int Scale = 8192;
 const int BlockSize = 64;
 const int Dims = 14;
-const int K = 256;
+const int K = 4096;
 const int KMeansIter = 25;
-const int SampleSize = 65536;
+const int SampleSize = 262144;
 const short PaddingSentinel = 8192;
 const int Magic = unchecked((int)0x32465649); // "IVF2"
 
@@ -171,6 +171,24 @@ for (int k = 0; k < K; k++)
     blockCount += numBlocks;
 }
 
+// Compute per-cluster bounding boxes (only real vectors, not padding)
+var bboxMin = new short[K * Dims];
+var bboxMax = new short[K * Dims];
+Array.Fill(bboxMin, short.MaxValue);
+Array.Fill(bboxMax, short.MinValue);
+for (int k = 0; k < K; k++)
+{
+    var members = clusterMembers[k];
+    if (members.Count == 0) { Array.Fill(bboxMin, (short)0, k * Dims, Dims); Array.Fill(bboxMax, (short)0, k * Dims, Dims); continue; }
+    for (int d = 0; d < Dims; d++)
+    {
+        short mn = short.MaxValue, mx = short.MinValue;
+        foreach (int idx in members) { short v = allVecs[idx * 16 + d]; if (v < mn) mn = v; if (v > mx) mx = v; }
+        bboxMin[k * Dims + d] = mn;
+        bboxMax[k * Dims + d] = mx;
+    }
+}
+
 using var bw = new BinaryWriter(File.Create(output));
 
 // Header
@@ -186,6 +204,10 @@ for (int i = 0; i < K * 16; i++)
 // Cluster metadata
 for (int k = 0; k < K; k++) bw.Write(clusterBlockStart[k]);
 for (int k = 0; k < K; k++) bw.Write(clusterBlockLen[k]);
+
+// Bounding boxes (K * Dims shorts each)
+foreach (var v in bboxMin) bw.Write(v);
+foreach (var v in bboxMax) bw.Write(v);
 
 // Blocks (ordered by cluster)
 for (int k = 0; k < K; k++)

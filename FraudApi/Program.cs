@@ -44,6 +44,7 @@ var normalization = JsonSerializer.Deserialize(
 )!;
 
 var nprobe = int.TryParse(Environment.GetEnvironmentVariable("NPROBE"), out var np) ? np : 16;
+var nprobeRetry = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_RETRY"), out var nr) ? nr : 64;
 
 unsafe
 {
@@ -55,8 +56,11 @@ unsafe
         mmap.Centroids,
         mmap.ClusterBlockStart,
         mmap.ClusterBlockLen,
+        mmap.BboxMin,
+        mmap.BboxMax,
         mmap.K,
-        nprobe
+        nprobe,
+        nprobeRetry
     );
 }
 

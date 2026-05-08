@@ -24,12 +24,13 @@ services:
   api1:
     build:
       context: .
-      dockerfile: Dockerfile.local
+      dockerfile: Dockerfile
     hostname: api1
     security_opt:
       - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-16}
+      - NPROBE_RETRY=${NPROBE_RETRY:-64}
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -47,12 +48,13 @@ services:
   api2:
     build:
       context: .
-      dockerfile: Dockerfile.local
+      dockerfile: Dockerfile
     hostname: api2
     security_opt:
       - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-16}
+      - NPROBE_RETRY=${NPROBE_RETRY:-64}
     volumes:
       - uds-sockets:/sockets
     healthcheck:

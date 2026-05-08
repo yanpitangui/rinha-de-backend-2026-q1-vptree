@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
@@ -11,30 +12,42 @@ public unsafe class SearchEngine
     private readonly byte* _labels;
     private readonly int _k;
     private readonly int _nprobe;
+    private readonly int _nprobeRetry;
     private readonly float[] _centroids;
     private readonly int[] _clusterBlockStart;
     private readonly int[] _clusterBlockLen;
+    private readonly short* _bboxMin;
+    private readonly short* _bboxMax;
 
     public SearchEngine(
         Block* blocks, byte* labels,
         float[] centroids, int[] clusterBlockStart, int[] clusterBlockLen,
-        int k, int nprobe)
+        short* bboxMin, short* bboxMax,
+        int k, int nprobe, int nprobeRetry)
     {
         _blocks = blocks;
         _labels = labels;
         _centroids = centroids;
         _clusterBlockStart = clusterBlockStart;
         _clusterBlockLen = clusterBlockLen;
+        _bboxMin = bboxMin;
+        _bboxMax = bboxMax;
         _k = k;
         _nprobe = nprobe;
+        _nprobeRetry = nprobeRetry;
     }
 
     public int Search(Span<short> query)
     {
+        // Pre-convert query to float once — reused for all centroid distance calls
+        Span<float> queryF = stackalloc float[16];
+        for (int d = 0; d < 14; d++) queryF[d] = query[d];
+
+        // Find nprobe nearest clusters, already sorted ascending by distance
         Span<int> probeIdx = stackalloc int[_nprobe];
         Span<float> probeDists = stackalloc float[_nprobe];
-        FindTopClusters(query, probeIdx, probeDists);
-        SortProbes(probeIdx, probeDists);
+        probeDists.Fill(float.MaxValue);
+        FindNearestClusters(queryF, probeIdx, probeDists, ReadOnlySpan<ulong>.Empty);
 
         Span<int> best = stackalloc int[5];
         Span<byte> bestLabels = stackalloc byte[5];
@@ -44,29 +57,27 @@ public unsafe class SearchEngine
 
         fixed (short* qPtr = query)
         {
-            for (int pi = 0; pi < _nprobe; pi++)
+            ScanProbes(qPtr, query, probeIdx, ref bound, best, bestLabels, dist);
+
+            if (_nprobeRetry > 0)
             {
-                int ci = probeIdx[pi];
-                int bEnd = _clusterBlockStart[ci] + _clusterBlockLen[ci];
-                for (int b = _clusterBlockStart[ci]; b < bEnd; b++)
+                int fc = 0;
+                for (int i = 0; i < 5; i++) fc += bestLabels[i];
+
+                // Borderline: fc=2 (score=0.4, approved but close) or fc=3 (score=0.6, rejected threshold)
+                if (fc == 2 || fc == 3)
                 {
-                    dist.Clear();
-                    Block* block = _blocks + b;
-                    ProcessDim(block->D0,  qPtr[0],  dist);
-                    ProcessDim(block->D1,  qPtr[1],  dist);
-                    ProcessDim(block->D2,  qPtr[2],  dist);
-                    ProcessDim(block->D3,  qPtr[3],  dist);
-                    ProcessDim(block->D4,  qPtr[4],  dist);
-                    ProcessDim(block->D5,  qPtr[5],  dist);
-                    ProcessDim(block->D6,  qPtr[6],  dist);
-                    ProcessDim(block->D7,  qPtr[7],  dist);
-                    ProcessDim(block->D8,  qPtr[8],  dist);
-                    ProcessDim(block->D9,  qPtr[9],  dist);
-                    ProcessDim(block->D10, qPtr[10], dist);
-                    ProcessDim(block->D11, qPtr[11], dist);
-                    ProcessDim(block->D12, qPtr[12], dist);
-                    ProcessDim(block->D13, qPtr[13], dist);
-                    bound = UpdateTopK(dist, best, bestLabels, b * 64, bound);
+                    int words = (_k + 63) >> 6;
+                    Span<ulong> visited = stackalloc ulong[words];
+                    visited.Clear();
+                    for (int i = 0; i < _nprobe; i++)
+                        visited[probeIdx[i] >> 6] |= 1UL << (probeIdx[i] & 63);
+
+                    Span<int> retryIdx = stackalloc int[_nprobeRetry];
+                    Span<float> retryDists = stackalloc float[_nprobeRetry];
+                    retryDists.Fill(float.MaxValue);
+                    FindNearestClusters(queryF, retryIdx, retryDists, visited);
+                    ScanProbes(qPtr, query, retryIdx, ref bound, best, bestLabels, dist);
                 }
             }
         }
@@ -76,61 +87,124 @@ public unsafe class SearchEngine
         return count;
     }
 
-    private void FindTopClusters(Span<short> query, Span<int> probeIdx, Span<float> probeDists)
+    private void ScanProbes(short* qPtr, Span<short> query, Span<int> probeIdx, ref int bound, Span<int> best, Span<byte> bestLabels, Span<int> dist)
     {
-        Span<float> dists = stackalloc float[_k];
-        fixed (float* cPtr = _centroids)
+        int n = probeIdx.Length;
+        for (int pi = 0; pi < n; pi++)
         {
-            for (int ci = 0; ci < _k; ci++)
-            {
-                float d = 0;
-                float* c = cPtr + ci * 16;
-                for (int dim = 0; dim < 14; dim++)
-                {
-                    float diff = query[dim] - c[dim];
-                    d += diff * diff;
-                }
-                dists[ci] = d;
-            }
-        }
+            int ci = probeIdx[pi];
 
-        probeDists.Fill(float.MaxValue);
-        probeIdx.Fill(0);
+            // Skip cluster if its bbox is provably farther than current best
+            if (bound < int.MaxValue && BboxExceedsOrEquals(query, ci, bound)) continue;
 
-        for (int ci = 0; ci < _k; ci++)
-        {
-            float d = dists[ci];
-            int worstIdx = 0;
-            float worstDist = probeDists[0];
-            for (int j = 1; j < _nprobe; j++)
+            int bEnd = _clusterBlockStart[ci] + _clusterBlockLen[ci];
+            for (int b = _clusterBlockStart[ci]; b < bEnd; b++)
             {
-                if (probeDists[j] > worstDist) { worstDist = probeDists[j]; worstIdx = j; }
-            }
-            if (d < worstDist)
-            {
-                probeDists[worstIdx] = d;
-                probeIdx[worstIdx] = ci;
+                dist.Clear();
+                Block* block = _blocks + b;
+                ProcessDim(block->D0,  qPtr[0],  dist);
+                ProcessDim(block->D1,  qPtr[1],  dist);
+                ProcessDim(block->D2,  qPtr[2],  dist);
+                ProcessDim(block->D3,  qPtr[3],  dist);
+                ProcessDim(block->D4,  qPtr[4],  dist);
+                ProcessDim(block->D5,  qPtr[5],  dist);
+                ProcessDim(block->D6,  qPtr[6],  dist);
+                ProcessDim(block->D7,  qPtr[7],  dist);
+                ProcessDim(block->D8,  qPtr[8],  dist);
+                ProcessDim(block->D9,  qPtr[9],  dist);
+                ProcessDim(block->D10, qPtr[10], dist);
+                ProcessDim(block->D11, qPtr[11], dist);
+                ProcessDim(block->D12, qPtr[12], dist);
+                ProcessDim(block->D13, qPtr[13], dist);
+                bound = UpdateTopK(dist, best, bestLabels, b * 64, bound);
             }
         }
     }
 
-    // Insertion sort — nprobe is small (default 16)
-    private static void SortProbes(Span<int> idx, Span<float> dists)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool BboxExceedsOrEquals(Span<short> query, int ci, int bound)
     {
-        for (int i = 1; i < idx.Length; i++)
+        int lb = 0;
+        int bboxBase = ci * 14;
+        for (int d = 0; d < 14; d++)
         {
-            float d = dists[i];
-            int id = idx[i];
-            int j = i - 1;
-            while (j >= 0 && dists[j] > d)
-            {
-                dists[j + 1] = dists[j];
-                idx[j + 1] = idx[j];
-                j--;
-            }
-            dists[j + 1] = d;
-            idx[j + 1] = id;
+            int q = query[d];
+            int lo = _bboxMin[bboxBase + d];
+            int hi = _bboxMax[bboxBase + d];
+            if (q < lo) { int diff = lo - q; lb += diff * diff; }
+            else if (q > hi) { int diff = q - hi; lb += diff * diff; }
+            if (lb >= bound) return true;
         }
+        return false;
+    }
+
+    // Finds the n nearest cluster centroids to queryF (already as float).
+    // Excluded bitset: skip any cluster with its bit set (used for retry pass).
+    // Results are maintained in sorted ascending order (nearest first).
+    private void FindNearestClusters(Span<float> queryF, Span<int> probeIdx, Span<float> probeDists, ReadOnlySpan<ulong> excluded)
+    {
+        int n = probeIdx.Length;
+        bool hasExcluded = excluded.Length > 0;
+
+        fixed (float* cPtr = _centroids)
+        fixed (float* qfPtr = queryF)
+        {
+#if TARGET_X64
+            if (Avx.IsSupported && Sse.IsSupported)
+            {
+                var qv0 = Avx.LoadVector256(qfPtr);      // dims 0-7
+                var qv1 = Avx.LoadVector256(qfPtr + 8);  // dims 8-15 (14,15 = 0.0 padding in centroids)
+
+                for (int ci = 0; ci < _k; ci++)
+                {
+                    if (hasExcluded && (excluded[ci >> 6] & (1UL << (ci & 63))) != 0) continue;
+
+                    float* c = cPtr + ci * 16;
+                    var d0 = Avx.Subtract(qv0, Avx.LoadVector256(c));
+                    var d1 = Avx.Subtract(qv1, Avx.LoadVector256(c + 8));
+                    d0 = Avx.Multiply(d0, d0);
+                    d1 = Avx.Multiply(d1, d1);
+                    var sum = Avx.Add(d0, d1);
+                    // Horizontal sum of 8 floats → scalar
+                    var lo128 = sum.GetLower();
+                    var hi128 = sum.GetUpper();
+                    var s = Sse.Add(lo128, hi128);
+                    s = Sse.Add(s, Sse.MoveHighToLow(s, s));
+                    s = Sse.AddScalar(s, Sse.Shuffle(s, s, 0b_00_00_00_01));
+                    float dist = s.ToScalar();
+
+                    if (dist < probeDists[n - 1])
+                        InsertSorted(probeIdx, probeDists, ci, dist, n);
+                }
+                return;
+            }
+#endif
+            for (int ci = 0; ci < _k; ci++)
+            {
+                if (hasExcluded && (excluded[ci >> 6] & (1UL << (ci & 63))) != 0) continue;
+
+                float d = 0;
+                float* c = cPtr + ci * 16;
+                for (int dim = 0; dim < 14; dim++) { float diff = queryF[dim] - c[dim]; d += diff * diff; }
+
+                if (d < probeDists[n - 1])
+                    InsertSorted(probeIdx, probeDists, ci, d, n);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void InsertSorted(Span<int> idx, Span<float> dists, int ci, float dist, int n)
+    {
+        int pos = n - 1;
+        while (pos > 0 && dists[pos - 1] > dist)
+        {
+            dists[pos] = dists[pos - 1];
+            idx[pos] = idx[pos - 1];
+            pos--;
+        }
+        dists[pos] = dist;
+        idx[pos] = ci;
     }
 
     private unsafe int UpdateTopK(Span<int> dist, Span<int> best, Span<byte> bestLabels, int labelBase, int bound)
@@ -140,7 +214,6 @@ public unsafe class SearchEngine
             int d = dist[i];
             if (d >= bound) continue;
 
-            // Sorted insertion: maintain best[] ascending so best[4] is always the tightest bound
             int pos = 3;
             while (pos >= 0 && best[pos] > d)
             {
