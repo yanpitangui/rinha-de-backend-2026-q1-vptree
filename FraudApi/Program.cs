@@ -45,6 +45,7 @@ var normalization = JsonSerializer.Deserialize(
 
 var nprobe = int.TryParse(Environment.GetEnvironmentVariable("NPROBE"), out var np) ? np : 16;
 var nprobeRetry = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_RETRY"), out var nr) ? nr : 64;
+var nprobeExhaust = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_EXHAUST"), out var ne) ? ne : 512;
 
 unsafe
 {
@@ -60,7 +61,8 @@ unsafe
         mmap.BboxMax,
         mmap.K,
         nprobe,
-        nprobeRetry
+        nprobeRetry,
+        nprobeExhaust
     );
 }
 
@@ -72,6 +74,13 @@ FraudHandler.Responses = BuildResponses();
 var app = builder.Build();
 
 app.MapGet("/ready", () => Results.Ok());
+
+app.MapGet("/perf", () =>
+{
+    var (centroidUs, scanUs, requests) = SearchEngine.PerfStats();
+    var json = $"{{\"requests\":{requests},\"centroid_us\":{centroidUs:F2},\"scan_us\":{scanUs:F2},\"total_us\":{centroidUs + scanUs:F2}}}";
+    return Results.Content(json, "application/json");
+});
 
 app.MapPost("/fraud-score", FraudHandler.Handle);
 

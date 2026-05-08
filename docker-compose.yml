@@ -33,6 +33,7 @@ services:
       - NPROBE_RETRY=${NPROBE_RETRY:-64}
     volumes:
       - uds-sockets:/sockets
+    cpuset: "0,1"
     healthcheck:
       test: ["CMD-SHELL", "test -S /sockets/api1.sock"]
       interval: 2s
@@ -57,6 +58,7 @@ services:
       - NPROBE_RETRY=${NPROBE_RETRY:-64}
     volumes:
       - uds-sockets:/sockets
+    cpuset: "2,3"
     healthcheck:
       test: ["CMD-SHELL", "test -S /sockets/api2.sock"]
       interval: 2s

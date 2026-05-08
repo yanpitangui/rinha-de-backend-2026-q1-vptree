@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
+using System.Threading;
 using FraudApi.Shared;
 
 namespace FraudApi.FraudDetection;
@@ -13,17 +14,34 @@ public unsafe class SearchEngine
     private readonly int _k;
     private readonly int _nprobe;
     private readonly int _nprobeRetry;
+    private readonly int _nprobeExhaust;
     private readonly float[] _centroids;
     private readonly int[] _clusterBlockStart;
     private readonly int[] _clusterBlockLen;
     private readonly short* _bboxMin;
     private readonly short* _bboxMax;
 
+    // Profiling accumulators (Interlocked, no locking)
+    private static long _perfCentroidTicks;
+    private static long _perfScanTicks;
+    private static long _perfRequests;
+
+    public static (double centroidUs, double scanUs, long requests) PerfStats()
+    {
+        long reqs = Volatile.Read(ref _perfRequests);
+        if (reqs == 0) return (0, 0, 0);
+        double freq = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
+        return (
+            Volatile.Read(ref _perfCentroidTicks) / freq / reqs,
+            Volatile.Read(ref _perfScanTicks) / freq / reqs,
+            reqs);
+    }
+
     public SearchEngine(
         Block* blocks, byte* labels,
         float[] centroids, int[] clusterBlockStart, int[] clusterBlockLen,
         short* bboxMin, short* bboxMax,
-        int k, int nprobe, int nprobeRetry)
+        int k, int nprobe, int nprobeRetry, int nprobeExhaust)
     {
         _blocks = blocks;
         _labels = labels;
@@ -35,10 +53,13 @@ public unsafe class SearchEngine
         _k = k;
         _nprobe = nprobe;
         _nprobeRetry = nprobeRetry;
+        _nprobeExhaust = nprobeExhaust;
     }
 
     public int Search(Span<short> query)
     {
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+
         // Pre-convert query to float once — reused for all centroid distance calls
         Span<float> queryF = stackalloc float[16];
         for (int d = 0; d < 14; d++) queryF[d] = query[d];
@@ -48,6 +69,8 @@ public unsafe class SearchEngine
         Span<float> probeDists = stackalloc float[_nprobe];
         probeDists.Fill(float.MaxValue);
         FindNearestClusters(queryF, probeIdx, probeDists, ReadOnlySpan<ulong>.Empty);
+
+        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
 
         Span<int> best = stackalloc int[5];
         Span<byte> bestLabels = stackalloc byte[5];
@@ -64,7 +87,6 @@ public unsafe class SearchEngine
                 int fc = 0;
                 for (int i = 0; i < 5; i++) fc += bestLabels[i];
 
-                // Borderline: fc=2 (score=0.4, approved but close) or fc=3 (score=0.6, rejected threshold)
                 if (fc == 2 || fc == 3)
                 {
                     int words = (_k + 63) >> 6;
@@ -73,14 +95,20 @@ public unsafe class SearchEngine
                     for (int i = 0; i < _nprobe; i++)
                         visited[probeIdx[i] >> 6] |= 1UL << (probeIdx[i] & 63);
 
-                    Span<int> retryIdx = stackalloc int[_nprobeRetry];
-                    Span<float> retryDists = stackalloc float[_nprobeRetry];
+                    int extraProbes = fc == 3 ? _nprobeExhaust : _nprobeRetry;
+                    Span<int> retryIdx = stackalloc int[extraProbes];
+                    Span<float> retryDists = stackalloc float[extraProbes];
                     retryDists.Fill(float.MaxValue);
                     FindNearestClusters(queryF, retryIdx, retryDists, visited);
                     ScanProbes(qPtr, query, retryIdx, ref bound, best, bestLabels, dist);
                 }
             }
         }
+
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        System.Threading.Interlocked.Add(ref _perfCentroidTicks, t1 - t0);
+        System.Threading.Interlocked.Add(ref _perfScanTicks, t2 - t1);
+        System.Threading.Interlocked.Increment(ref _perfRequests);
 
         int count = 0;
         for (int i = 0; i < 5; i++) count += bestLabels[i];
@@ -100,28 +128,13 @@ public unsafe class SearchEngine
             int bEnd = _clusterBlockStart[ci] + _clusterBlockLen[ci];
             for (int b = _clusterBlockStart[ci]; b < bEnd; b++)
             {
-                dist.Clear();
-                Block* block = _blocks + b;
-                ProcessDim(block->D0,  qPtr[0],  dist);
-                ProcessDim(block->D1,  qPtr[1],  dist);
-                ProcessDim(block->D2,  qPtr[2],  dist);
-                ProcessDim(block->D3,  qPtr[3],  dist);
-                ProcessDim(block->D4,  qPtr[4],  dist);
-                ProcessDim(block->D5,  qPtr[5],  dist);
-                ProcessDim(block->D6,  qPtr[6],  dist);
-                ProcessDim(block->D7,  qPtr[7],  dist);
-                ProcessDim(block->D8,  qPtr[8],  dist);
-                ProcessDim(block->D9,  qPtr[9],  dist);
-                ProcessDim(block->D10, qPtr[10], dist);
-                ProcessDim(block->D11, qPtr[11], dist);
-                ProcessDim(block->D12, qPtr[12], dist);
-                ProcessDim(block->D13, qPtr[13], dist);
+                ProcessAllDims(_blocks + b, qPtr, dist);
                 bound = UpdateTopK(dist, best, bestLabels, b * 64, bound);
             }
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool BboxExceedsOrEquals(Span<short> query, int ci, int bound)
     {
         int lb = 0;
@@ -226,6 +239,53 @@ public unsafe class SearchEngine
             bound = best[4];
         }
         return bound;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void ProcessAllDims(Block* block, short* q, Span<int> dist)
+    {
+        // Block layout: D0[64], D1[64], ..., D13[64] sequential (each dim = 128 bytes).
+        // Process 4 chunks of 16 vectors. For each chunk, keep acc in YMM registers
+        // across all 14 dims — avoids 14x load+store of dist[] per chunk.
+        short* blockBase = (short*)block;
+        fixed (int* dptr = dist)
+        {
+#if TARGET_X64
+            if (Avx2.IsSupported)
+            {
+                for (int chunk = 0; chunk < 4; chunk++)
+                {
+                    int vBase = chunk * 16;
+                    var acc_lo = Vector256<int>.Zero;
+                    var acc_hi = Vector256<int>.Zero;
+
+                    for (int d = 0; d < 14; d++)
+                    {
+                        var qd = Vector256.Create((int)q[d]);
+                        var v  = Avx.LoadVector256(blockBase + d * 64 + vBase);
+                        var lo = Avx2.ConvertToVector256Int32(v.GetLower());
+                        var hi = Avx2.ConvertToVector256Int32(v.GetUpper());
+                        var dlo = Avx2.Subtract(lo, qd);
+                        var dhi = Avx2.Subtract(hi, qd);
+                        acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo));
+                        acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
+                    }
+
+                    Avx.Store(dptr + vBase,     acc_lo);
+                    Avx.Store(dptr + vBase + 8, acc_hi);
+                }
+                return;
+            }
+#endif
+            // Scalar fallback
+            for (int i = 0; i < 64; i++) dptr[i] = 0;
+            for (int d = 0; d < 14; d++)
+            {
+                int qd = q[d];
+                short* dd = blockBase + d * 64;
+                for (int i = 0; i < 64; i++) { int diff = dd[i] - qd; dptr[i] += diff * diff; }
+            }
+        }
     }
 
     private static unsafe void ProcessDim(short* data, short q, Span<int> dist)
