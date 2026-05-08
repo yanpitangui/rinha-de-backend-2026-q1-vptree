@@ -24,7 +24,7 @@ services:
   api1:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.local
     hostname: api1
     security_opt:
       - seccomp:unconfined
@@ -48,7 +48,7 @@ services:
   api2:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.local
     hostname: api2
     security_opt:
       - seccomp:unconfined
