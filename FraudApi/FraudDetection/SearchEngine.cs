@@ -21,23 +21,7 @@ public unsafe class SearchEngine
     private readonly short* _bboxMin;
     private readonly short* _bboxMax;
 
-    // Profiling accumulators (Interlocked, no locking)
-    private static long _perfCentroidTicks;
-    private static long _perfScanTicks;
-    private static long _perfRequests;
-
-    public static (double centroidUs, double scanUs, long requests) PerfStats()
-    {
-        long reqs = Volatile.Read(ref _perfRequests);
-        if (reqs == 0) return (0, 0, 0);
-        double freq = System.Diagnostics.Stopwatch.Frequency / 1_000_000.0;
-        return (
-            Volatile.Read(ref _perfCentroidTicks) / freq / reqs,
-            Volatile.Read(ref _perfScanTicks) / freq / reqs,
-            reqs);
-    }
-
-    public SearchEngine(
+     public SearchEngine(
         Block* blocks, byte* labels,
         float[] centroids, int[] clusterBlockStart, int[] clusterBlockLen,
         short* bboxMin, short* bboxMax,
@@ -58,8 +42,6 @@ public unsafe class SearchEngine
 
     public int Search(Span<short> query)
     {
-        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-
         // Pre-convert query to float once — reused for all centroid distance calls
         Span<float> queryF = stackalloc float[16];
         for (int d = 0; d < 14; d++) queryF[d] = query[d];
@@ -69,8 +51,6 @@ public unsafe class SearchEngine
         Span<float> probeDists = stackalloc float[_nprobe];
         probeDists.Fill(float.MaxValue);
         FindNearestClusters(queryF, probeIdx, probeDists, ReadOnlySpan<ulong>.Empty);
-
-        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
 
         Span<int> best = stackalloc int[5];
         Span<byte> bestLabels = stackalloc byte[5];
@@ -104,11 +84,6 @@ public unsafe class SearchEngine
                 }
             }
         }
-
-        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-        System.Threading.Interlocked.Add(ref _perfCentroidTicks, t1 - t0);
-        System.Threading.Interlocked.Add(ref _perfScanTicks, t2 - t1);
-        System.Threading.Interlocked.Increment(ref _perfRequests);
 
         int count = 0;
         for (int i = 0; i < 5; i++) count += bestLabels[i];

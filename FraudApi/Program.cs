@@ -75,13 +75,6 @@ var app = builder.Build();
 
 app.MapGet("/ready", () => Results.Ok());
 
-app.MapGet("/perf", () =>
-{
-    var (centroidUs, scanUs, requests) = SearchEngine.PerfStats();
-    var json = $"{{\"requests\":{requests},\"centroid_us\":{centroidUs:F2},\"scan_us\":{scanUs:F2},\"total_us\":{centroidUs + scanUs:F2}}}";
-    return Results.Content(json, "application/json");
-});
-
 app.MapPost("/fraud-score", FraudHandler.Handle);
 
 // chmod the socket so nginx can access it
