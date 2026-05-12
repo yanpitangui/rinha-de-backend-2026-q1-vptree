@@ -67,7 +67,7 @@ public unsafe class SearchEngine
                 int fc = 0;
                 for (int i = 0; i < 5; i++) fc += bestLabels[i];
 
-                if (fc == 2 || fc == 3)
+                if (fc >= 1 && fc <= 4)
                 {
                     int words = (_k + 63) >> 6;
                     Span<ulong> visited = stackalloc ulong[words];
@@ -75,7 +75,9 @@ public unsafe class SearchEngine
                     for (int i = 0; i < _nprobe; i++)
                         visited[probeIdx[i] >> 6] |= 1UL << (probeIdx[i] & 63);
 
-                    int extraProbes = fc == 3 ? _nprobeExhaust : _nprobeRetry;
+                    // fc ∈ {2,3} is most ambiguous (straddles the 0.6 approval boundary) — exhaust
+                    // fc ∈ {1,4} is less ambiguous but with nprobe=1 we still verify
+                    int extraProbes = (fc == 2 || fc == 3) ? _nprobeExhaust : _nprobeRetry;
                     Span<int> retryIdx = stackalloc int[extraProbes];
                     Span<float> retryDists = stackalloc float[extraProbes];
                     retryDists.Fill(float.MaxValue);

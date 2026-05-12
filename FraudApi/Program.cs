@@ -1,8 +1,16 @@
+using System.Runtime;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using FraudApi.Config;
 using FraudApi.Data;
 using FraudApi.FraudDetection;
+
+GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+
+var minWorkers = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_WORKERS"), out var minW) ? minW : 16;
+var maxWorkers = int.TryParse(Environment.GetEnvironmentVariable("TP_MAX_WORKERS"), out var maxW) ? maxW : 16;
+ThreadPool.SetMinThreads(minWorkers, minWorkers);
+ThreadPool.SetMaxThreads(maxWorkers, maxWorkers);
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
@@ -43,7 +51,7 @@ var normalization = JsonSerializer.Deserialize(
     AppJsonSerializerContext.Default.NormalizationConfig
 )!;
 
-var nprobe = int.TryParse(Environment.GetEnvironmentVariable("NPROBE"), out var np) ? np : 16;
+var nprobe = int.TryParse(Environment.GetEnvironmentVariable("NPROBE"), out var np) ? np : 1;
 var nprobeRetry = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_RETRY"), out var nr) ? nr : 64;
 var nprobeExhaust = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_EXHAUST"), out var ne) ? ne : 512;
 
