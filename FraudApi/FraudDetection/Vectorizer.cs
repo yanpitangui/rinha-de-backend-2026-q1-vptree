@@ -5,7 +5,7 @@ namespace FraudApi.FraudDetection;
 
 public static class Vectorizer
 {
-    private const int Scale = 8192;
+    public const int Scale = 10000;
 
     // Precomputed LUTs for hour (0-23) and day-of-week (0-6, mon=0)
     private static readonly short[] HourLut = BuildLut(24, 23.0);

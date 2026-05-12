@@ -2,7 +2,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
-using System.Threading;
 using FraudApi.Shared;
 
 namespace FraudApi.FraudDetection;
@@ -20,12 +19,14 @@ public unsafe class SearchEngine
     private readonly int[] _clusterBlockLen;
     private readonly short* _bboxMin;
     private readonly short* _bboxMax;
+    private readonly int[] _dimOrder; // variance-sorted dim indices, high→low
 
-     public SearchEngine(
+    public SearchEngine(
         Block* blocks, byte* labels,
         float[] centroids, int[] clusterBlockStart, int[] clusterBlockLen,
         short* bboxMin, short* bboxMax,
-        int k, int nprobe, int nprobeRetry, int nprobeExhaust)
+        int k, int nprobe, int nprobeRetry, int nprobeExhaust,
+        int[] dimOrder)
     {
         _blocks = blocks;
         _labels = labels;
@@ -38,15 +39,14 @@ public unsafe class SearchEngine
         _nprobe = nprobe;
         _nprobeRetry = nprobeRetry;
         _nprobeExhaust = nprobeExhaust;
+        _dimOrder = dimOrder;
     }
 
     public int Search(Span<short> query)
     {
-        // Pre-convert query to float once — reused for all centroid distance calls
         Span<float> queryF = stackalloc float[16];
         for (int d = 0; d < 14; d++) queryF[d] = query[d];
 
-        // Find nprobe nearest clusters, already sorted ascending by distance
         Span<int> probeIdx = stackalloc int[_nprobe];
         Span<float> probeDists = stackalloc float[_nprobe];
         probeDists.Fill(float.MaxValue);
@@ -56,11 +56,11 @@ public unsafe class SearchEngine
         Span<byte> bestLabels = stackalloc byte[5];
         best.Fill(int.MaxValue);
         int bound = int.MaxValue;
-        Span<int> dist = stackalloc int[64];
 
         fixed (short* qPtr = query)
+        fixed (int* dimOrderPtr = _dimOrder)
         {
-            ScanProbes(qPtr, query, probeIdx, ref bound, best, bestLabels, dist);
+            ScanProbes(qPtr, query, probeIdx, ref bound, best, bestLabels, dimOrderPtr);
 
             if (_nprobeRetry > 0)
             {
@@ -75,14 +75,13 @@ public unsafe class SearchEngine
                     for (int i = 0; i < _nprobe; i++)
                         visited[probeIdx[i] >> 6] |= 1UL << (probeIdx[i] & 63);
 
-                    // fc ∈ {2,3} is most ambiguous (straddles the 0.6 approval boundary) — exhaust
-                    // fc ∈ {1,4} is less ambiguous but with nprobe=1 we still verify
+                    // fc∈{2,3} straddles approval boundary — use exhaust budget
                     int extraProbes = (fc == 2 || fc == 3) ? _nprobeExhaust : _nprobeRetry;
                     Span<int> retryIdx = stackalloc int[extraProbes];
                     Span<float> retryDists = stackalloc float[extraProbes];
                     retryDists.Fill(float.MaxValue);
                     FindNearestClusters(queryF, retryIdx, retryDists, visited);
-                    ScanProbes(qPtr, query, retryIdx, ref bound, best, bestLabels, dist);
+                    ScanProbes(qPtr, query, retryIdx, ref bound, best, bestLabels, dimOrderPtr);
                 }
             }
         }
@@ -92,14 +91,14 @@ public unsafe class SearchEngine
         return count;
     }
 
-    private void ScanProbes(short* qPtr, Span<short> query, Span<int> probeIdx, ref int bound, Span<int> best, Span<byte> bestLabels, Span<int> dist)
+    private void ScanProbes(short* qPtr, Span<short> query, Span<int> probeIdx,
+        ref int bound, Span<int> best, Span<byte> bestLabels, int* dimOrderPtr)
     {
         int n = probeIdx.Length;
+        int* dptr = stackalloc int[8];
         for (int pi = 0; pi < n; pi++)
         {
             int ci = probeIdx[pi];
-
-            // Skip cluster if its bbox is provably farther than current best
             if (bound < int.MaxValue && BboxExceedsOrEquals(query, ci, bound)) continue;
 
             int bStart = _clusterBlockStart[ci];
@@ -108,13 +107,23 @@ public unsafe class SearchEngine
             {
                 if (Sse.IsSupported && b + 3 < bEnd)
                     Sse.Prefetch0(_blocks + b + 3);
-                ProcessAllDims(_blocks + b, qPtr, dist);
-                bound = UpdateTopK(dist, best, bestLabels, b * 64, bound);
+
+                ProcessAllDims(_blocks + b, qPtr, dptr, dimOrderPtr);
+
+                // Block-level early exit: skip top-k update when all 8 distances >= bound
+#if TARGET_X64
+                if (bound < int.MaxValue && Avx2.IsSupported)
+                {
+                    var cmp = Avx2.CompareGreaterThan(Vector256.Create(bound), Avx.LoadVector256(dptr));
+                    if (Avx2.MoveMask(cmp.AsByte()) == 0) continue;
+                }
+#endif
+                bound = UpdateTopK(dptr, best, bestLabels, b * 8, bound);
             }
         }
     }
 
-[MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool BboxExceedsOrEquals(Span<short> query, int ci, int bound)
     {
         int lb = 0;
@@ -131,9 +140,6 @@ public unsafe class SearchEngine
         return false;
     }
 
-    // Finds the n nearest cluster centroids to queryF (already as float).
-    // Excluded bitset: skip any cluster with its bit set (used for retry pass).
-    // Results are maintained in sorted ascending order (nearest first).
     private void FindNearestClusters(Span<float> queryF, Span<int> probeIdx, Span<float> probeDists, ReadOnlySpan<ulong> excluded)
     {
         int n = probeIdx.Length;
@@ -145,8 +151,8 @@ public unsafe class SearchEngine
 #if TARGET_X64
             if (Avx.IsSupported && Sse.IsSupported)
             {
-                var qv0 = Avx.LoadVector256(qfPtr);      // dims 0-7
-                var qv1 = Avx.LoadVector256(qfPtr + 8);  // dims 8-15 (14,15 = 0.0 padding in centroids)
+                var qv0 = Avx.LoadVector256(qfPtr);
+                var qv1 = Avx.LoadVector256(qfPtr + 8);
 
                 for (int ci = 0; ci < _k; ci++)
                 {
@@ -158,7 +164,6 @@ public unsafe class SearchEngine
                     d0 = Avx.Multiply(d0, d0);
                     d1 = Avx.Multiply(d1, d1);
                     var sum = Avx.Add(d0, d1);
-                    // Horizontal sum of 8 floats → scalar
                     var lo128 = sum.GetLower();
                     var hi128 = sum.GetUpper();
                     var s = Sse.Add(lo128, hi128);
@@ -200,12 +205,12 @@ public unsafe class SearchEngine
         idx[pos] = ci;
     }
 
-    private unsafe int UpdateTopK(Span<int> dist, Span<int> best, Span<byte> bestLabels, int labelBase, int bound)
+    private unsafe int UpdateTopK(int* dptr, Span<int> best, Span<byte> bestLabels, int labelBase, int bound)
     {
-        for (int i = 0; i < 64; i++)
+        for (int i = 0; i < 8; i++)
         {
-            int d = dist[i];
-            if (d > bound) continue;
+            int d = dptr[i];
+            if (d >= bound) continue;
 
             int pos = 3;
             while (pos >= 0 && best[pos] > d)
@@ -222,175 +227,55 @@ public unsafe class SearchEngine
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void ProcessAllDims(Block* block, short* q, Span<int> dist)
+    private static unsafe void ProcessAllDims(Block* block, short* q, int* dptr, int* dimOrder)
     {
-        // Block layout: D0[64], D1[64], ..., D13[64] sequential (each dim = 128 bytes).
-        // Process 4 chunks of 16 vectors. For each chunk, keep acc in YMM registers
-        // across all 14 dims — avoids 14x load+store of dist[] per chunk.
         short* blockBase = (short*)block;
-        fixed (int* dptr = dist)
-        {
 #if TARGET_X64
-            if (Avx2.IsSupported)
+        if (Avx2.IsSupported)
+        {
+            var acc = Vector256<int>.Zero;
+            for (int di = 0; di < 14; di++)
             {
-                // Hoist query broadcasts outside chunk loop — 14 vpbroadcastd instead of 56
-                var qv0  = Vector256.Create((int)q[0]);
-                var qv1  = Vector256.Create((int)q[1]);
-                var qv2  = Vector256.Create((int)q[2]);
-                var qv3  = Vector256.Create((int)q[3]);
-                var qv4  = Vector256.Create((int)q[4]);
-                var qv5  = Vector256.Create((int)q[5]);
-                var qv6  = Vector256.Create((int)q[6]);
-                var qv7  = Vector256.Create((int)q[7]);
-                var qv8  = Vector256.Create((int)q[8]);
-                var qv9  = Vector256.Create((int)q[9]);
-                var qv10 = Vector256.Create((int)q[10]);
-                var qv11 = Vector256.Create((int)q[11]);
-                var qv12 = Vector256.Create((int)q[12]);
-                var qv13 = Vector256.Create((int)q[13]);
-
-                for (int chunk = 0; chunk < 4; chunk++)
-                {
-                    int vBase = chunk * 16;
-                    var acc_lo = Vector256<int>.Zero;
-                    var acc_hi = Vector256<int>.Zero;
-                    Vector256<short> v;
-                    Vector256<int> lo, hi, dlo, dhi;
-
-                    v = Avx.LoadVector256(blockBase + 0 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv0); dhi = Avx2.Subtract(hi, qv0);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 1 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv1); dhi = Avx2.Subtract(hi, qv1);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 2 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv2); dhi = Avx2.Subtract(hi, qv2);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 3 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv3); dhi = Avx2.Subtract(hi, qv3);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 4 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv4); dhi = Avx2.Subtract(hi, qv4);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 5 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv5); dhi = Avx2.Subtract(hi, qv5);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 6 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv6); dhi = Avx2.Subtract(hi, qv6);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 7 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv7); dhi = Avx2.Subtract(hi, qv7);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 8 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv8); dhi = Avx2.Subtract(hi, qv8);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 9 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv9); dhi = Avx2.Subtract(hi, qv9);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 10 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv10); dhi = Avx2.Subtract(hi, qv10);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 11 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv11); dhi = Avx2.Subtract(hi, qv11);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 12 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv12); dhi = Avx2.Subtract(hi, qv12);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    v = Avx.LoadVector256(blockBase + 13 * 64 + vBase);
-                    lo = Avx2.ConvertToVector256Int32(v.GetLower()); hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    dlo = Avx2.Subtract(lo, qv13); dhi = Avx2.Subtract(hi, qv13);
-                    acc_lo = Avx2.Add(acc_lo, Avx2.MultiplyLow(dlo, dlo)); acc_hi = Avx2.Add(acc_hi, Avx2.MultiplyLow(dhi, dhi));
-
-                    Avx.Store(dptr + vBase,     acc_lo);
-                    Avx.Store(dptr + vBase + 8, acc_hi);
-                }
-                return;
+                int d = dimOrder[di];
+                var qv = Vector256.Create((int)q[d]);
+                var v8 = Vector128.Load(blockBase + d * 8);
+                var wide = Avx2.ConvertToVector256Int32(v8);
+                var diff = Avx2.Subtract(wide, qv);
+                acc = Avx2.Add(acc, Avx2.MultiplyLow(diff, diff));
             }
-#endif
-            // Scalar fallback
-            for (int i = 0; i < 64; i++) dptr[i] = 0;
-            for (int d = 0; d < 14; d++)
-            {
-                int qd = q[d];
-                short* dd = blockBase + d * 64;
-                for (int i = 0; i < 64; i++) { int diff = dd[i] - qd; dptr[i] += diff * diff; }
-            }
+            Avx.Store(dptr, acc);
+            return;
         }
-    }
-
-    private static unsafe void ProcessDim(short* data, short q, Span<int> dist)
-    {
-        fixed (int* dptr = dist)
-        {
-#if TARGET_X64
-            if (Avx2.IsSupported)
-            {
-                var qVec = Vector256.Create((int)q);
-                for (int i = 0; i < 64; i += 16)
-                {
-                    var v = Avx.LoadVector256(data + i);
-                    var lo = Avx2.ConvertToVector256Int32(v.GetLower());
-                    var hi = Avx2.ConvertToVector256Int32(v.GetUpper());
-                    var dlo = Avx2.Subtract(lo, qVec);
-                    var dhi = Avx2.Subtract(hi, qVec);
-                    var sqLo = Avx2.MultiplyLow(dlo, dlo);
-                    var sqHi = Avx2.MultiplyLow(dhi, dhi);
-                    Avx.Store(dptr + i,     Avx2.Add(Avx.LoadVector256(dptr + i),     sqLo));
-                    Avx.Store(dptr + i + 8, Avx2.Add(Avx.LoadVector256(dptr + i + 8), sqHi));
-                }
-                return;
-            }
 #endif
 #if TARGET_ARM64
-            if (AdvSimd.IsSupported)
+        if (AdvSimd.IsSupported)
+        {
+            var acc_lo = Vector128<int>.Zero;
+            var acc_hi = Vector128<int>.Zero;
+            for (int di = 0; di < 14; di++)
             {
-                var qVec = Vector128.Create((int)q);
-                for (int i = 0; i < 64; i += 8)
-                {
-                    var v = AdvSimd.LoadVector128(data + i);
-                    var lo = AdvSimd.SignExtendWideningLower(v.GetLower());
-                    var hi = AdvSimd.SignExtendWideningUpper(v);
-                    var dlo = AdvSimd.Subtract(lo, qVec);
-                    var dhi = AdvSimd.Subtract(hi, qVec);
-                    var sqLo = AdvSimd.Multiply(dlo, dlo);
-                    var sqHi = AdvSimd.Multiply(dhi, dhi);
-                    AdvSimd.Store(dptr + i,     AdvSimd.Add(AdvSimd.LoadVector128(dptr + i),     sqLo));
-                    AdvSimd.Store(dptr + i + 4, AdvSimd.Add(AdvSimd.LoadVector128(dptr + i + 4), sqHi));
-                }
-                return;
+                int d = dimOrder[di];
+                var qv = Vector128.Create((int)q[d]);
+                var v8 = AdvSimd.LoadVector128(blockBase + d * 8);
+                var lo = AdvSimd.SignExtendWideningLower(v8.GetLower());
+                var hi = AdvSimd.SignExtendWideningUpper(v8);
+                var dlo = AdvSimd.Subtract(lo, qv);
+                var dhi = AdvSimd.Subtract(hi, qv);
+                acc_lo = AdvSimd.Add(acc_lo, AdvSimd.Multiply(dlo, dlo));
+                acc_hi = AdvSimd.Add(acc_hi, AdvSimd.Multiply(dhi, dhi));
             }
+            AdvSimd.Store(dptr,     acc_lo);
+            AdvSimd.Store(dptr + 4, acc_hi);
+            return;
+        }
 #endif
-            for (int i = 0; i < 64; i++)
-            {
-                int d = data[i] - q;
-                dptr[i] += d * d;
-            }
+        for (int i = 0; i < 8; i++) dptr[i] = 0;
+        for (int di = 0; di < 14; di++)
+        {
+            int d = dimOrder[di];
+            int qd = q[d];
+            short* dd = blockBase + d * 8;
+            for (int i = 0; i < 8; i++) { int diff = dd[i] - qd; dptr[i] += diff * diff; }
         }
     }
 }

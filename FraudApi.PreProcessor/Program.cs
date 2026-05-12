@@ -2,13 +2,13 @@ using System.IO.Compression;
 using System.Text.Json;
 using FraudApi.Shared;
 
-const int Scale = 8192;
-const int BlockSize = 64;
+const int Scale = 10000;
+const int BlockSize = 8;
 const int Dims = 14;
-const int K = 4096;
+const int K = 1280;
 const int KMeansIter = 25;
 const int SampleSize = 262144;
-const short PaddingSentinel = 8192;
+const short PaddingSentinel = Scale; // > any valid value, keeps padded slots far from queries
 const int Magic = unchecked((int)0x32465649); // "IVF2"
 
 var resourcesPath =
@@ -40,10 +40,9 @@ int total = 0;
     bool inVector = false;
     int vi = 0;
     bool isFraud = false;
-
     bool vecComplete = false;
 
-    void ProcessToken2(ref Utf8JsonReader r)
+    void ProcessToken(ref Utf8JsonReader r)
     {
         switch (r.TokenType)
         {
@@ -78,7 +77,7 @@ int total = 0;
         bytesInBuffer += bytesRead;
 
         var reader = new Utf8JsonReader(new ReadOnlySpan<byte>(buffer, 0, bytesInBuffer), false, state);
-        while (reader.Read()) ProcessToken2(ref reader);
+        while (reader.Read()) ProcessToken(ref reader);
 
         int consumed = (int)reader.BytesConsumed;
         Buffer.BlockCopy(buffer, consumed, buffer, 0, bytesInBuffer - consumed);
@@ -87,31 +86,54 @@ int total = 0;
     }
 
     var finalReader = new Utf8JsonReader(new ReadOnlySpan<byte>(buffer, 0, bytesInBuffer), true, state);
-    while (finalReader.Read()) ProcessToken2(ref finalReader);
+    while (finalReader.Read()) ProcessToken(ref finalReader);
 }
 
-Console.WriteLine($"Loaded {total} vectors. Running k-means (K={K})...");
+Console.WriteLine($"Loaded {total} vectors. Computing dim variance...");
 
-// ── Phase 2: k-means++ on a sample ───────────────────────────────────────
+// ── Phase 2: compute per-dim variance using Welford's online algorithm ─────
+// High-variance dims are checked first in ProcessAllDims for maximum early-exit pruning.
+var mean = new double[Dims];
+var m2   = new double[Dims];
+for (int i = 0; i < total; i++)
+{
+    int vb = i * 16;
+    for (int d = 0; d < Dims; d++)
+    {
+        double x = allVecs[vb + d];
+        double delta = x - mean[d];
+        mean[d] += delta / (i + 1);
+        m2[d] += delta * (x - mean[d]);
+    }
+}
+var dimVariance = new double[Dims];
+for (int d = 0; d < Dims; d++) dimVariance[d] = m2[d] / total;
+
+var dimOrder = Enumerable.Range(0, Dims).OrderByDescending(d => dimVariance[d]).ToArray();
+Console.WriteLine($"Dim order (high→low variance): [{string.Join(", ", dimOrder)}]");
+for (int i = 0; i < Dims; i++)
+    Console.WriteLine($"  dim[{dimOrder[i],2}] variance={dimVariance[dimOrder[i]]:F2}");
+
+// ── Phase 3: k-means++ on a sample ───────────────────────────────────────
+Console.WriteLine($"Running k-means (K={K})...");
 var rng = new Random(42);
 var sampleIdx = ReservoirSample(total, SampleSize, rng);
 var centroids = RunKMeans(allVecs, sampleIdx, K, KMeansIter, "mixed", rng);
 
-// ── Phase 3: assign all vectors to clusters ───────────────────────────────
+// ── Phase 4: assign all vectors to clusters ───────────────────────────────
 Console.WriteLine("Assigning all vectors to clusters...");
 var assignments = new int[total];
 Parallel.For(0, total, i =>
     assignments[i] = NearestCentroidInRange(allVecs, i * 16, centroids, 0, K));
 
-// ── Phase 4: group by cluster ─────────────────────────────────────────────
+// ── Phase 5: group by cluster ─────────────────────────────────────────────
 var clusterMembers = new List<int>[K];
-for (int k = 0; k < K; k++) clusterMembers[k] = new List<int>(total / K + 64);
+for (int k = 0; k < K; k++) clusterMembers[k] = new List<int>(total / K + BlockSize);
 for (int i = 0; i < total; i++) clusterMembers[assignments[i]].Add(i);
 
-// ── Phase 5: write binary ─────────────────────────────────────────────────
+// ── Phase 6: write binary ─────────────────────────────────────────────────
 Console.WriteLine("Writing dataset.bin...");
 
-// Compute block counts per cluster (pad to multiple of BlockSize)
 var clusterBlockStart = new int[K];
 var clusterBlockLen   = new int[K];
 int blockCount = 0;
@@ -119,12 +141,11 @@ for (int k = 0; k < K; k++)
 {
     clusterBlockStart[k] = blockCount;
     int numBlocks = (clusterMembers[k].Count + BlockSize - 1) / BlockSize;
-    if (numBlocks == 0) numBlocks = 1; // empty cluster still gets one block
+    if (numBlocks == 0) numBlocks = 1;
     clusterBlockLen[k] = numBlocks;
     blockCount += numBlocks;
 }
 
-// Compute per-cluster bounding boxes (only real vectors, not padding)
 var bboxMin = new short[K * Dims];
 var bboxMax = new short[K * Dims];
 Array.Fill(bboxMin, short.MaxValue);
@@ -132,7 +153,12 @@ Array.Fill(bboxMax, short.MinValue);
 for (int k = 0; k < K; k++)
 {
     var members = clusterMembers[k];
-    if (members.Count == 0) { Array.Fill(bboxMin, (short)0, k * Dims, Dims); Array.Fill(bboxMax, (short)0, k * Dims, Dims); continue; }
+    if (members.Count == 0)
+    {
+        Array.Fill(bboxMin, (short)0, k * Dims, Dims);
+        Array.Fill(bboxMax, (short)0, k * Dims, Dims);
+        continue;
+    }
     for (int d = 0; d < Dims; d++)
     {
         short mn = short.MaxValue, mx = short.MinValue;
@@ -150,9 +176,11 @@ bw.Write(blockCount);
 bw.Write(total);
 bw.Write(K);
 
+// DimOrder (14 ints) — must match MmapData.cs offset 16
+foreach (var d in dimOrder) bw.Write(d);
+
 // Centroids (K * 16 floats)
-for (int i = 0; i < K * 16; i++)
-    bw.Write(centroids[i]);
+for (int i = 0; i < K * 16; i++) bw.Write(centroids[i]);
 
 // Cluster metadata
 for (int k = 0; k < K; k++) bw.Write(clusterBlockStart[k]);
@@ -168,24 +196,20 @@ for (int k = 0; k < K; k++)
     var members = clusterMembers[k];
     int numBlocks = clusterBlockLen[k];
     for (int bi = 0; bi < numBlocks; bi++)
-    {
         WriteBlock(bw, allVecs, members, bi * BlockSize, Math.Min(BlockSize, members.Count - bi * BlockSize));
-    }
 }
 
-// Labels (ordered by cluster, including padding as 0)
+// Labels (ordered by cluster, padded with 0)
 for (int k = 0; k < K; k++)
 {
     var members = clusterMembers[k];
     int numBlocks = clusterBlockLen[k];
     for (int bi = 0; bi < numBlocks; bi++)
-    {
         for (int pos = 0; pos < BlockSize; pos++)
         {
             int memberPos = bi * BlockSize + pos;
             bw.Write(memberPos < members.Count ? allLabels[members[memberPos]] : (byte)0);
         }
-    }
 }
 
 Console.WriteLine($"Done. total={total}, K={K}, blockCount={blockCount}");
@@ -215,7 +239,6 @@ static int[] ReservoirSample(int n, int s, Random rng)
 static float[] KMeansPlusPlusInit(short[] vecs, int[] sample, int k, Random rng)
 {
     var centroids = new float[k * 16];
-    // First centroid: random sample
     int first = sample[rng.Next(sample.Length)] * 16;
     for (int d = 0; d < Dims; d++) centroids[d] = vecs[first + d];
 
@@ -224,14 +247,12 @@ static float[] KMeansPlusPlusInit(short[] vecs, int[] sample, int k, Random rng)
 
     for (int ci = 1; ci < k; ci++)
     {
-        // Update min distances — each si writes only minDist[si], safe to parallelize
         int prevCBase = (ci - 1) * 16;
         Parallel.For(0, sample.Length, si =>
         {
             float d = CentroidDist(vecs, sample[si] * 16, centroids, prevCBase);
             if (d < minDist[si]) minDist[si] = d;
         });
-        // Pick next centroid with probability proportional to minDist^2
         float total = 0;
         for (int si = 0; si < sample.Length; si++) total += minDist[si];
         float threshold = (float)(rng.NextDouble() * total);
@@ -260,7 +281,6 @@ static float CentroidDist(short[] vecs, int vBase, float[] centroids, int cBase)
     return dist;
 }
 
-// Search only centroids [start..start+count) — returns index relative to start
 static int NearestCentroidInRange(short[] vecs, int vBase, float[] centroids, int start, int count)
 {
     int best = 0;
@@ -283,11 +303,9 @@ static float[] RunKMeans(short[] vecs, int[] sampleIdx, int k, int iters, string
 
     for (int iter = 0; iter < iters; iter++)
     {
-        // Parallel assignment
         Parallel.For(0, sampleIdx.Length, si =>
             tempAssign[si] = NearestCentroidInRange(vecs, sampleIdx[si] * 16, centroids, 0, k));
 
-        // Parallel accumulation with thread-local buffers merged at end
         Array.Clear(newCentroids);
         Array.Clear(counts);
         Parallel.For(0, sampleIdx.Length,

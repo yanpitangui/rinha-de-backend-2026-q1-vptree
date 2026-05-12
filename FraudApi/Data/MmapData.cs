@@ -15,6 +15,7 @@ public sealed unsafe class MmapData
     public float[] Centroids = null!;
     public int[] ClusterBlockStart = null!;
     public int[] ClusterBlockLen = null!;
+    public int[] DimOrder = null!; // 14 dim indices sorted by variance descending
 
     private byte[] _data = null!;
 
@@ -31,7 +32,13 @@ public sealed unsafe class MmapData
             int total      = *(int*)(ptr + 8);
             int k          = *(int*)(ptr + 12);
 
-            float* centroidPtr = (float*)(ptr + 16);
+            // dimOrder: 14 ints at offset 16
+            int* dimOrderPtr = (int*)(ptr + 16);
+            var dimOrder = new int[14];
+            new ReadOnlySpan<int>(dimOrderPtr, 14).CopyTo(dimOrder);
+
+            // centroids: after dimOrder (offset 16 + 14*4 = 72)
+            float* centroidPtr = (float*)(ptr + 72);
             var centroids = new float[k * 16];
             new ReadOnlySpan<float>(centroidPtr, k * 16).CopyTo(centroids);
 
@@ -62,6 +69,7 @@ public sealed unsafe class MmapData
                 Centroids = centroids,
                 ClusterBlockStart = clusterBlockStart,
                 ClusterBlockLen = clusterBlockLen,
+                DimOrder = dimOrder,
                 _data = data
             };
         }

@@ -70,7 +70,8 @@ unsafe
         mmap.K,
         nprobe,
         nprobeRetry,
-        nprobeExhaust
+        nprobeExhaust,
+        mmap.DimOrder
     );
 }
 
