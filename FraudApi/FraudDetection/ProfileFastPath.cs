@@ -66,8 +66,12 @@ public sealed class ProfileFastPath
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int FindBin(short[] edges, short v)
     {
-        for (int b = 0; b < edges.Length; b++)
-            if (v < edges[b]) return b;
-        return edges.Length;
+        int lo = 0, hi = edges.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            if (v < edges[mid]) hi = mid; else lo = mid + 1;
+        }
+        return lo;
     }
 }

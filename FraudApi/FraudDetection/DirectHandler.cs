@@ -252,9 +252,7 @@ public static class DirectHandler
         }
         else
         {
-            var dt = ParseUtcDateTime(reqAt);
-            var prev = ParseUtcDateTime(lastAt);
-            dst[5] = Q(Clamp((dt - prev).TotalMinutes / n.MaxMinutes));
+            dst[5] = Q(Clamp(MinutesDiff(lastAt, reqAt) / n.MaxMinutes));
             dst[6] = Q(Clamp(kmFromCurrent / n.MaxKm));
         }
 
@@ -298,8 +296,18 @@ public static class DirectHandler
         return ((byte)h, (byte)dw);
     }
 
+    // Returns elapsed minutes between two "YYYY-MM-DDTHH:MM:SSZ" timestamps (from - to).
+    // Uses DateTime only for the day-of-year component; avoids the full DateTime subtraction allocation.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static DateTime ParseUtcDateTime(ReadOnlySpan<byte> s)
+    private static double MinutesDiff(ReadOnlySpan<byte> from, ReadOnlySpan<byte> to)
+    {
+        var dtFrom = ParseUtcTicks(from);
+        var dtTo   = ParseUtcTicks(to);
+        return (dtTo - dtFrom) / (double)TimeSpan.TicksPerMinute;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long ParseUtcTicks(ReadOnlySpan<byte> s)
     {
         int y   = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
         int mo  = (s[5] - '0') * 10 + (s[6] - '0');
@@ -307,7 +315,7 @@ public static class DirectHandler
         int h   = (s[11] - '0') * 10 + (s[12] - '0');
         int mi  = (s[14] - '0') * 10 + (s[15] - '0');
         int sec = (s[17] - '0') * 10 + (s[18] - '0');
-        return new DateTime(y, mo, d, h, mi, sec, DateTimeKind.Utc);
+        return new DateTime(y, mo, d, h, mi, sec, DateTimeKind.Utc).Ticks;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
