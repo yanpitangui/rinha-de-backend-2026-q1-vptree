@@ -36,7 +36,6 @@ services:
       - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
     volumes:
       - uds-sockets:/sockets
-    cpuset: "0,1"
     healthcheck:
       test: ["CMD-SHELL", "test -S /sockets/api1.sock"]
       interval: 2s
@@ -64,7 +63,6 @@ services:
       - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
     volumes:
       - uds-sockets:/sockets
-    cpuset: "2,3"
     healthcheck:
       test: ["CMD-SHELL", "test -S /sockets/api2.sock"]
       interval: 2s
