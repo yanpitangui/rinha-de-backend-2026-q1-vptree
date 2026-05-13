@@ -313,25 +313,14 @@ static float[] RunKMeans(short[] vecs, int[] sampleIdx, int k, int iters, string
 
         Array.Clear(newCentroids);
         Array.Clear(counts);
-        Parallel.For(0, sampleIdx.Length,
-            () => (Acc: new float[k * 16], Cnt: new int[k]),
-            (si, _, local) =>
-            {
-                int ck = tempAssign[si];
-                int vb = sampleIdx[si] * 16;
-                for (int d = 0; d < Dims; d++)
-                    local.Acc[ck * 16 + d] += vecs[vb + d];
-                local.Cnt[ck]++;
-                return local;
-            },
-            local =>
-            {
-                lock (newCentroids)
-                {
-                    for (int i = 0; i < k * 16; i++) newCentroids[i] += local.Acc[i];
-                    for (int i = 0; i < k; i++) counts[i] += local.Cnt[i];
-                }
-            });
+        for (int si = 0; si < sampleIdx.Length; si++)
+        {
+            int ck = tempAssign[si];
+            int vb = sampleIdx[si] * 16;
+            for (int d = 0; d < Dims; d++)
+                newCentroids[ck * 16 + d] += vecs[vb + d];
+            counts[ck]++;
+        }
 
         for (int ck = 0; ck < k; ck++)
         {
