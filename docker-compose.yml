@@ -22,7 +22,7 @@ services:
           memory: "30MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:latest
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:96e1e093524136d1849a47b3905ce23ef22e96ed
     hostname: api1
     security_opt:
       - seccomp:unconfined
@@ -47,7 +47,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:latest
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:96e1e093524136d1849a47b3905ce23ef22e96ed
     hostname: api2
     security_opt:
       - seccomp:unconfined
