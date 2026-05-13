@@ -58,6 +58,7 @@ var nprobeExhaust = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_EXHA
 unsafe
 {
     var mmap = MmapData.Load(Path.Combine(resourcesPath, "dataset.bin"));
+    FraudHandler.MmapRef = mmap; // prevent GC from collecting pinned Block*/byte* data
 
     FraudHandler.Engine = new SearchEngine(
         mmap.Blocks,
@@ -79,6 +80,10 @@ unsafe
 FraudHandler.MccRisk = mccRisk;
 FraudHandler.Norm = normalization;
 FraudHandler.Responses = BuildResponses();
+
+var fastPathFile = Path.Combine(resourcesPath, "fastpath.bin");
+if (File.Exists(fastPathFile))
+    FraudHandler.FastPath = ProfileFastPath.Load(fastPathFile);
 
 var app = builder.Build();
 

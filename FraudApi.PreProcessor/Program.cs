@@ -214,6 +214,10 @@ for (int k = 0; k < K; k++)
 
 Console.WriteLine($"Done. total={total}, K={K}, blockCount={blockCount}");
 
+// ── Phase 7: build profile fast-path table ────────────────────────────────
+Console.WriteLine("Building profile fast-path table...");
+BuildFastPath(allVecs, allLabels, total, resourcesPath);
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 static short Quantize(double v)
@@ -347,6 +351,108 @@ static float[] RunKMeans(short[] vecs, int[] sampleIdx, int k, int iters, string
         if ((iter + 1) % 5 == 0) Console.WriteLine($"    {label} iter {iter+1}/{iters}");
     }
     return centroids;
+}
+
+static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string resourcesPath)
+{
+    // Feature dims and bit allocations — must match ProfileFastPath.cs constants
+    int[] featureIndex = [0, 7, 10, 1, 9, 11, 12, 3];
+    int[] bits         = [4, 3,  6, 1, 3,  4, 1,  2]; // sum=24 → 16 MiB table
+
+    int nf = featureIndex.Length;
+    int tableSize = 1 << bits.Sum();
+
+    // Compute cumulative bit shifts
+    var shifts = new int[nf];
+    shifts[0] = 0;
+    for (int f = 1; f < nf; f++) shifts[f] = shifts[f - 1] + bits[f - 1];
+
+    // Compute quantile edges per feature in int16 space
+    var edges = new short[nf][];
+    for (int f = 0; f < nf; f++)
+    {
+        int dim = featureIndex[f];
+        int numBins  = 1 << bits[f];
+        int numEdges = numBins - 1;
+
+        var values = new short[total];
+        for (int i = 0; i < total; i++) values[i] = allVecs[i * 16 + dim];
+        Array.Sort(values);
+
+        edges[f] = new short[numEdges];
+        for (int b = 0; b < numEdges; b++)
+        {
+            int pos = (int)((long)(b + 1) * total / numBins);
+            edges[f][b] = values[pos];
+        }
+    }
+
+    // Accumulate (count_legit | count_fraud) per bucket key
+    // ulong encoding: upper 32 bits = legit count, lower 32 bits = fraud count
+    var buckets = new Dictionary<uint, ulong>(1 << 20);
+    for (int i = 0; i < total; i++)
+    {
+        uint key = 0;
+        for (int f = 0; f < nf; f++)
+        {
+            short v = allVecs[i * 16 + featureIndex[f]];
+            int bin = FindBinS(edges[f], v);
+            key |= (uint)bin << shifts[f];
+        }
+
+        ulong inc = allLabels[i] == 0 ? (1UL << 32) : 1UL; // legit → upper, fraud → lower
+        buckets[key] = buckets.TryGetValue(key, out var cur) ? cur + inc : inc;
+    }
+
+    // Read env-var thresholds (defaults match the best C# competitor)
+    int kLegit = int.TryParse(Environment.GetEnvironmentVariable("FP_MIN_LEGIT"), out var kl) ? kl : 100;
+    int kFraud = int.TryParse(Environment.GetEnvironmentVariable("FP_MIN_FRAUD"), out var kf) ? kf : 400;
+
+    // Build dense byte table
+    var table = new byte[tableSize];
+    int pureLegiit = 0, pureFraud = 0;
+    foreach (var kv in buckets)
+    {
+        int legit = (int)(kv.Value >> 32);
+        int fraud = (int)(uint)kv.Value;
+        if (fraud == 0 && legit >= kLegit) { table[kv.Key] = 1; pureLegiit++; }
+        else if (legit == 0 && fraud >= kFraud) { table[kv.Key] = 2; pureFraud++; }
+    }
+
+    // Estimate hit rate from the reference data itself
+    long hits = 0;
+    for (int i = 0; i < total; i++)
+    {
+        uint key = 0;
+        for (int f = 0; f < nf; f++)
+        {
+            short v = allVecs[i * 16 + featureIndex[f]];
+            key |= (uint)FindBinS(edges[f], v) << shifts[f];
+        }
+        if (table[key] != 0) hits++;
+    }
+    Console.WriteLine($"  Pure-legit buckets: {pureLegiit}, pure-fraud: {pureFraud}");
+    Console.WriteLine($"  Estimated hit rate: {hits * 100.0 / total:F2}% ({hits}/{total})");
+
+    // Write fastpath.bin
+    var outputPath = Path.Combine(resourcesPath, "fastpath.bin");
+    using var bw2 = new BinaryWriter(File.Create(outputPath));
+    bw2.Write(unchecked((int)0x46415354)); // magic "FAST"
+    for (int f = 0; f < nf; f++)
+    {
+        bw2.Write(edges[f].Length);
+        foreach (var e in edges[f]) bw2.Write(e);
+    }
+    bw2.Write(tableSize);
+    bw2.Write(table);
+    Console.WriteLine($"  Written {outputPath} ({new FileInfo(outputPath).Length / 1024 / 1024} MiB)");
+}
+
+static int FindBinS(short[] edges, short v)
+{
+    for (int b = 0; b < edges.Length; b++)
+        if (v < edges[b]) return b;
+    return edges.Length;
 }
 
 static unsafe void WriteBlock(BinaryWriter bw, short[] vecs, List<int> members, int start, int realCount)

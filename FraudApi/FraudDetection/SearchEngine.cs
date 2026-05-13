@@ -95,7 +95,9 @@ public unsafe class SearchEngine
         ref int bound, Span<int> best, Span<byte> bestLabels, int* dimOrderPtr)
     {
         int n = probeIdx.Length;
-        int* dptr = stackalloc int[8];
+        // Align to 32 bytes so AVX2 store/load never fault on aligned variants.
+        int* dptrRaw = stackalloc int[16];
+        int* dptr = (int*)(((nint)dptrRaw + 31) & ~31);
         for (int pi = 0; pi < n; pi++)
         {
             int ci = probeIdx[pi];
@@ -109,15 +111,6 @@ public unsafe class SearchEngine
                     Sse.Prefetch0(_blocks + b + 8);
 
                 if (!ProcessAllDims(_blocks + b, qPtr, dptr, dimOrderPtr, bound)) continue;
-
-                // End-of-block exit: all 8 final distances >= bound
-#if TARGET_X64
-                if (bound < int.MaxValue && Avx2.IsSupported)
-                {
-                    var cmp = Avx2.CompareGreaterThan(Vector256.Create(bound), Avx.LoadVector256(dptr));
-                    if (Avx2.MoveMask(cmp.AsByte()) == 0) continue;
-                }
-#endif
                 bound = UpdateTopK(dptr, best, bestLabels, b * 8, bound);
             }
         }
