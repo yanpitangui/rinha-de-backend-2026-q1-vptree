@@ -27,8 +27,11 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
-      - NPROBE=${NPROBE:-16}
+      - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-64}
+      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-256}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-16}
+      - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
     volumes:
       - uds-sockets:/sockets
     cpuset: "0,1"
@@ -50,8 +53,11 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
-      - NPROBE=${NPROBE:-16}
+      - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-64}
+      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-256}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-16}
+      - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
     volumes:
       - uds-sockets:/sockets
     cpuset: "2,3"
