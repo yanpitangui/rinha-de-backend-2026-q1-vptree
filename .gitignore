@@ -6,4 +6,6 @@ riderModule.iml
 .idea
 
 resources/dataset.bin
+resources/fastpath.bin
 resources/references.json.gz
+resources/references.json
