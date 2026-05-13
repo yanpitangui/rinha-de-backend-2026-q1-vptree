@@ -237,9 +237,9 @@ public unsafe class SearchEngine
                 var diff = Avx2.Subtract(wide, qv);
                 acc = Avx2.Add(acc, Avx2.MultiplyLow(diff, diff));
 
-                // After 8 dims (half-way): partial-distance early exit.
-                // High-variance dims come first (dimOrder), so acc grows fast.
-                if (di == 7 && bound < int.MaxValue)
+                // Two partial-distance checkpoints. High-variance dims first → acc grows fast.
+                // Both are mathematically safe: partial ≤ full distance (all diffs² ≥ 0).
+                if ((di == 3 || di == 7) && bound < int.MaxValue)
                 {
                     var cmp = Avx2.CompareGreaterThan(Vector256.Create(bound), acc);
                     if (Avx2.MoveMask(cmp.AsByte()) == 0) return false;
