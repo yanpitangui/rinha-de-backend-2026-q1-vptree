@@ -89,7 +89,7 @@ var app = builder.Build();
 
 app.MapGet("/ready", () => Results.Ok());
 
-app.MapPost("/fraud-score", FraudHandler.Handle);
+app.MapPost("/fraud-score", (RequestDelegate)DirectHandler.Handle);
 
 // chmod the socket so nginx can access it
 var socketPath = $"/sockets/{System.Net.Dns.GetHostName()}.sock";
@@ -118,7 +118,6 @@ static byte[][] BuildResponses()
     return arr;
 }
 
-[JsonSerializable(typeof(FraudRequest))]
 [JsonSerializable(typeof(NormalizationConfig))]
 [JsonSerializable(typeof(Dictionary<string, double>))]
 internal partial class AppJsonSerializerContext : JsonSerializerContext
