@@ -28,8 +28,8 @@ services:
       - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-2}
-      - NPROBE_RETRY=${NPROBE_RETRY:-64}
-      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-256}
+      - NPROBE_RETRY=${NPROBE_RETRY:-16}
+      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-32}
       - TP_MIN_WORKERS=${TP_MIN_WORKERS:-16}
       - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
     volumes:
@@ -54,8 +54,8 @@ services:
       - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-2}
-      - NPROBE_RETRY=${NPROBE_RETRY:-64}
-      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-256}
+      - NPROBE_RETRY=${NPROBE_RETRY:-16}
+      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-32}
       - TP_MIN_WORKERS=${TP_MIN_WORKERS:-16}
       - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
     volumes:
