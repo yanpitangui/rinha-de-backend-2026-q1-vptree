@@ -159,12 +159,13 @@ for (int k = 0; k < K; k++)
         Array.Fill(bboxMax, (short)0, k * Dims, Dims);
         continue;
     }
-    for (int d = 0; d < Dims; d++)
+    for (int di = 0; di < Dims; di++)
     {
+        int d = dimOrder[di];
         short mn = short.MaxValue, mx = short.MinValue;
         foreach (int idx in members) { short v = allVecs[idx * 16 + d]; if (v < mn) mn = v; if (v > mx) mx = v; }
-        bboxMin[k * Dims + d] = mn;
-        bboxMax[k * Dims + d] = mx;
+        bboxMin[k * Dims + di] = mn;
+        bboxMax[k * Dims + di] = mx;
     }
 }
 
@@ -196,7 +197,7 @@ for (int k = 0; k < K; k++)
     var members = clusterMembers[k];
     int numBlocks = clusterBlockLen[k];
     for (int bi = 0; bi < numBlocks; bi++)
-        WriteBlock(bw, allVecs, members, bi * BlockSize, Math.Min(BlockSize, members.Count - bi * BlockSize));
+        WriteBlock(bw, allVecs, members, bi * BlockSize, Math.Min(BlockSize, members.Count - bi * BlockSize), dimOrder);
 }
 
 // Labels (ordered by cluster, padded with 0)
@@ -455,7 +456,7 @@ static int FindBinS(short[] edges, short v)
     return edges.Length;
 }
 
-static unsafe void WriteBlock(BinaryWriter bw, short[] vecs, List<int> members, int start, int realCount)
+static unsafe void WriteBlock(BinaryWriter bw, short[] vecs, List<int> members, int start, int realCount, int[] dimOrder)
 {
     Block b = default;
     short* ptr = (short*)&b;
@@ -463,8 +464,8 @@ static unsafe void WriteBlock(BinaryWriter bw, short[] vecs, List<int> members, 
     {
         int memberPos = start + pos;
         int vb = memberPos < members.Count ? members[memberPos] * 16 : -1;
-        for (int d = 0; d < Dims; d++)
-            ptr[d * BlockSize + pos] = vb >= 0 ? vecs[vb + d] : PaddingSentinel;
+        for (int di = 0; di < Dims; di++)
+            ptr[di * BlockSize + pos] = vb >= 0 ? vecs[vb + dimOrder[di]] : PaddingSentinel;
     }
     bw.Write(new ReadOnlySpan<byte>(ptr, sizeof(Block)));
 }

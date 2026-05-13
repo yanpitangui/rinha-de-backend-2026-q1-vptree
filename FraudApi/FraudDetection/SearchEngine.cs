@@ -57,10 +57,12 @@ public unsafe class SearchEngine
         best.Fill(int.MaxValue);
         int bound = int.MaxValue;
 
-        fixed (short* qPtr = query)
-        fixed (int* dimOrderPtr = _dimOrder)
+        Span<short> queryOrd = stackalloc short[16];
+        for (int di = 0; di < 14; di++) queryOrd[di] = query[_dimOrder[di]];
+
+        fixed (short* qOrdPtr = queryOrd)
         {
-            ScanProbes(qPtr, query, probeIdx, ref bound, best, bestLabels, dimOrderPtr);
+            ScanProbes(qOrdPtr, queryOrd, probeIdx, ref bound, best, bestLabels);
 
             if (_nprobeRetry > 0)
             {
@@ -81,7 +83,7 @@ public unsafe class SearchEngine
                     Span<float> retryDists = stackalloc float[extraProbes];
                     retryDists.Fill(float.MaxValue);
                     FindNearestClusters(queryF, retryIdx, retryDists, visited);
-                    ScanProbes(qPtr, query, retryIdx, ref bound, best, bestLabels, dimOrderPtr);
+                    ScanProbes(qOrdPtr, queryOrd, retryIdx, ref bound, best, bestLabels);
                 }
             }
         }
@@ -92,7 +94,7 @@ public unsafe class SearchEngine
     }
 
     private void ScanProbes(short* qPtr, Span<short> query, Span<int> probeIdx,
-        ref int bound, Span<int> best, Span<byte> bestLabels, int* dimOrderPtr)
+        ref int bound, Span<int> best, Span<byte> bestLabels)
     {
         int n = probeIdx.Length;
         // Align to 32 bytes so AVX2 store/load never fault on aligned variants.
@@ -110,7 +112,7 @@ public unsafe class SearchEngine
                 if (Sse.IsSupported && b + 8 < bEnd)
                     Sse.Prefetch0(_blocks + b + 8);
 
-                if (!ProcessAllDims(_blocks + b, qPtr, dptr, dimOrderPtr, bound)) continue;
+                if (!ProcessAllDims(_blocks + b, qPtr, dptr, bound)) continue;
                 bound = UpdateTopK(dptr, best, bestLabels, b * 8, bound);
             }
         }
@@ -220,8 +222,9 @@ public unsafe class SearchEngine
     }
 
     // Returns false if partial-distance early exit fired (block can be skipped).
+    // q and blockBase are both in variance order (reordered at call site once per query).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe bool ProcessAllDims(Block* block, short* q, int* dptr, int* dimOrder, int bound)
+    private static unsafe bool ProcessAllDims(Block* block, short* q, int* dptr, int bound)
     {
         short* blockBase = (short*)block;
 #if TARGET_X64
@@ -230,9 +233,8 @@ public unsafe class SearchEngine
             var acc = Vector256<int>.Zero;
             for (int di = 0; di < 14; di++)
             {
-                int d = dimOrder[di];
-                var qv = Vector256.Create((int)q[d]);
-                var v8 = Vector128.Load(blockBase + d * 8);
+                var qv = Vector256.Create((int)q[di]);
+                var v8 = Vector128.Load(blockBase + di * 8);
                 var wide = Avx2.ConvertToVector256Int32(v8);
                 var diff = Avx2.Subtract(wide, qv);
                 acc = Avx2.Add(acc, Avx2.MultiplyLow(diff, diff));
@@ -256,9 +258,8 @@ public unsafe class SearchEngine
             var acc_hi = Vector128<int>.Zero;
             for (int di = 0; di < 14; di++)
             {
-                int d = dimOrder[di];
-                var qv = Vector128.Create((int)q[d]);
-                var v8 = AdvSimd.LoadVector128(blockBase + d * 8);
+                var qv = Vector128.Create((int)q[di]);
+                var v8 = AdvSimd.LoadVector128(blockBase + di * 8);
                 var lo = AdvSimd.SignExtendWideningLower(v8.GetLower());
                 var hi = AdvSimd.SignExtendWideningUpper(v8);
                 var dlo = AdvSimd.Subtract(lo, qv);
@@ -274,9 +275,8 @@ public unsafe class SearchEngine
         for (int i = 0; i < 8; i++) dptr[i] = 0;
         for (int di = 0; di < 14; di++)
         {
-            int d = dimOrder[di];
-            int qd = q[d];
-            short* dd = blockBase + d * 8;
+            int qd = q[di];
+            short* dd = blockBase + di * 8;
             for (int i = 0; i < 8; i++) { int diff = dd[i] - qd; dptr[i] += diff * diff; }
         }
         return true;
