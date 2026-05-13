@@ -105,12 +105,12 @@ public unsafe class SearchEngine
             int bEnd   = bStart + _clusterBlockLen[ci];
             for (int b = bStart; b < bEnd; b++)
             {
-                if (Sse.IsSupported && b + 3 < bEnd)
-                    Sse.Prefetch0(_blocks + b + 3);
+                if (Sse.IsSupported && b + 8 < bEnd)
+                    Sse.Prefetch0(_blocks + b + 8);
 
-                ProcessAllDims(_blocks + b, qPtr, dptr, dimOrderPtr);
+                if (!ProcessAllDims(_blocks + b, qPtr, dptr, dimOrderPtr, bound)) continue;
 
-                // Block-level early exit: skip top-k update when all 8 distances >= bound
+                // End-of-block exit: all 8 final distances >= bound
 #if TARGET_X64
                 if (bound < int.MaxValue && Avx2.IsSupported)
                 {
@@ -226,8 +226,9 @@ public unsafe class SearchEngine
         return bound;
     }
 
+    // Returns false if partial-distance early exit fired (block can be skipped).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void ProcessAllDims(Block* block, short* q, int* dptr, int* dimOrder)
+    private static unsafe bool ProcessAllDims(Block* block, short* q, int* dptr, int* dimOrder, int bound)
     {
         short* blockBase = (short*)block;
 #if TARGET_X64
@@ -242,9 +243,17 @@ public unsafe class SearchEngine
                 var wide = Avx2.ConvertToVector256Int32(v8);
                 var diff = Avx2.Subtract(wide, qv);
                 acc = Avx2.Add(acc, Avx2.MultiplyLow(diff, diff));
+
+                // After 8 dims (half-way): partial-distance early exit.
+                // High-variance dims come first (dimOrder), so acc grows fast.
+                if (di == 7 && bound < int.MaxValue)
+                {
+                    var cmp = Avx2.CompareGreaterThan(Vector256.Create(bound), acc);
+                    if (Avx2.MoveMask(cmp.AsByte()) == 0) return false;
+                }
             }
             Avx.Store(dptr, acc);
-            return;
+            return true;
         }
 #endif
 #if TARGET_ARM64
@@ -266,7 +275,7 @@ public unsafe class SearchEngine
             }
             AdvSimd.Store(dptr,     acc_lo);
             AdvSimd.Store(dptr + 4, acc_hi);
-            return;
+            return true;
         }
 #endif
         for (int i = 0; i < 8; i++) dptr[i] = 0;
@@ -277,5 +286,6 @@ public unsafe class SearchEngine
             short* dd = blockBase + d * 8;
             for (int i = 0; i < 8; i++) { int diff = dd[i] - qd; dptr[i] += diff * diff; }
         }
+        return true;
     }
 }
