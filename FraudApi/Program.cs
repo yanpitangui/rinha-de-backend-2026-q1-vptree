@@ -7,11 +7,9 @@ using FraudApi.FraudDetection;
 
 GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
 
-var minWorkers = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_WORKERS"), out var minW) ? minW : 2;
-var maxWorkers = int.TryParse(Environment.GetEnvironmentVariable("TP_MAX_WORKERS"), out var maxW) ? maxW : 2;
+var minWorkers = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_WORKERS"), out var minW) ? minW : 8;
 var minIoThreads = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_IO"), out var minIo) ? minIo : 64;
 ThreadPool.SetMinThreads(minWorkers, minIoThreads);
-ThreadPool.SetMaxThreads(maxWorkers, minIoThreads);
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
