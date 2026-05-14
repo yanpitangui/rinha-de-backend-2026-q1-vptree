@@ -22,7 +22,7 @@ services:
           memory: "30MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:96e1e093524136d1849a47b3905ce23ef22e96ed
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:bccfdb1e420a0709580505f8051056be283d723b
     hostname: api1
     security_opt:
       - seccomp:unconfined
@@ -30,8 +30,8 @@ services:
       - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-16}
       - NPROBE_EXHAUST=${NPROBE_EXHAUST:-32}
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-16}
-      - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-2}
+      - TP_MAX_WORKERS=${TP_MAX_WORKERS:-2}
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -47,7 +47,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:96e1e093524136d1849a47b3905ce23ef22e96ed
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:bccfdb1e420a0709580505f8051056be283d723b
     hostname: api2
     security_opt:
       - seccomp:unconfined
@@ -55,8 +55,8 @@ services:
       - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-16}
       - NPROBE_EXHAUST=${NPROBE_EXHAUST:-32}
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-16}
-      - TP_MAX_WORKERS=${TP_MAX_WORKERS:-16}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-2}
+      - TP_MAX_WORKERS=${TP_MAX_WORKERS:-2}
     volumes:
       - uds-sockets:/sockets
     healthcheck:
