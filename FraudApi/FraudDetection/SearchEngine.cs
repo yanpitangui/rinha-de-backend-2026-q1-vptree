@@ -274,9 +274,9 @@ public unsafe class SearchEngine
                 var dhi = AdvSimd.Subtract(hi, qv);
                 var sqlo = AdvSimd.Multiply(dlo, dlo);
                 var sqhi = AdvSimd.Multiply(dhi, dhi);
-                acc0 = AdvSimd.Add(acc0, AdvSimd.SignExtendWideningLower(sqlo));
+                acc0 = AdvSimd.Add(acc0, AdvSimd.SignExtendWideningLower(sqlo.GetLower()));
                 acc1 = AdvSimd.Add(acc1, AdvSimd.SignExtendWideningUpper(sqlo));
-                acc2 = AdvSimd.Add(acc2, AdvSimd.SignExtendWideningLower(sqhi));
+                acc2 = AdvSimd.Add(acc2, AdvSimd.SignExtendWideningLower(sqhi.GetLower()));
                 acc3 = AdvSimd.Add(acc3, AdvSimd.SignExtendWideningUpper(sqhi));
             }
             AdvSimd.Store(dptr,     acc0);
