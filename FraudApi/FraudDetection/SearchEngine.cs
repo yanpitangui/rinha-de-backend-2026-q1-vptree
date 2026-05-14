@@ -42,6 +42,7 @@ public unsafe class SearchEngine
         _dimOrder = dimOrder;
     }
 
+    [SkipLocalsInit]
     public int Search(Span<short> query)
     {
         Span<float> queryF = stackalloc float[16];
@@ -52,10 +53,10 @@ public unsafe class SearchEngine
         probeDists.Fill(float.MaxValue);
         FindNearestClusters(queryF, probeIdx, probeDists, ReadOnlySpan<ulong>.Empty);
 
-        Span<int> best = stackalloc int[5];
+        Span<long> best = stackalloc long[5];
         Span<byte> bestLabels = stackalloc byte[5];
-        best.Fill(int.MaxValue);
-        int bound = int.MaxValue;
+        best.Fill(long.MaxValue);
+        long bound = long.MaxValue;
 
         Span<short> queryOrd = stackalloc short[16];
         for (int di = 0; di < 14; di++) queryOrd[di] = query[_dimOrder[di]];
@@ -93,17 +94,18 @@ public unsafe class SearchEngine
         return count;
     }
 
+    [SkipLocalsInit]
     private void ScanProbes(short* qPtr, Span<short> query, Span<int> probeIdx,
-        ref int bound, Span<int> best, Span<byte> bestLabels)
+        ref long bound, Span<long> best, Span<byte> bestLabels)
     {
         int n = probeIdx.Length;
         // Align to 32 bytes so AVX2 store/load never fault on aligned variants.
-        int* dptrRaw = stackalloc int[16];
-        int* dptr = (int*)(((nint)dptrRaw + 31) & ~31);
+        long* dptrRaw = stackalloc long[16];
+        long* dptr = (long*)(((nint)dptrRaw + 31) & ~31);
         for (int pi = 0; pi < n; pi++)
         {
             int ci = probeIdx[pi];
-            if (bound < int.MaxValue && BboxExceedsOrEquals(query, ci, bound)) continue;
+            if (bound < long.MaxValue && BboxExceedsOrEquals(query, ci, bound)) continue;
 
             int bStart = _clusterBlockStart[ci];
             int bEnd   = bStart + _clusterBlockLen[ci];
@@ -119,17 +121,17 @@ public unsafe class SearchEngine
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool BboxExceedsOrEquals(Span<short> query, int ci, int bound)
+    private bool BboxExceedsOrEquals(Span<short> query, int ci, long bound)
     {
-        int lb = 0;
+        long lb = 0;
         int bboxBase = ci * 14;
         for (int d = 0; d < 14; d++)
         {
             int q = query[d];
             int lo = _bboxMin[bboxBase + d];
             int hi = _bboxMax[bboxBase + d];
-            if (q < lo) { int diff = lo - q; lb += diff * diff; }
-            else if (q > hi) { int diff = q - hi; lb += diff * diff; }
+            if (q < lo) { long diff = lo - q; lb += diff * diff; }
+            else if (q > hi) { long diff = q - hi; lb += diff * diff; }
             if (lb > bound) return true;
         }
         return false;
@@ -200,11 +202,12 @@ public unsafe class SearchEngine
         idx[pos] = ci;
     }
 
-    private unsafe int UpdateTopK(int* dptr, Span<int> best, Span<byte> bestLabels, int labelBase, int bound)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private unsafe long UpdateTopK(long* dptr, Span<long> best, Span<byte> bestLabels, int labelBase, long bound)
     {
         for (int i = 0; i < 8; i++)
         {
-            int d = dptr[i];
+            long d = dptr[i];
             if (d >= bound) continue;
 
             int pos = 3;
@@ -223,39 +226,49 @@ public unsafe class SearchEngine
 
     // Returns false if partial-distance early exit fired (block can be skipped).
     // q and blockBase are both in variance order (reordered at call site once per query).
+    // Accumulates into long to avoid int32 overflow: max dist = 14 * (2*Scale)^2 = 5.6e9 > int.MaxValue.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe bool ProcessAllDims(Block* block, short* q, int* dptr, int bound)
+    [SkipLocalsInit]
+    private static unsafe bool ProcessAllDims(Block* block, short* q, long* dptr, long bound)
     {
         short* blockBase = (short*)block;
 #if TARGET_X64
         if (Avx2.IsSupported)
         {
-            var acc = Vector256<int>.Zero;
+            var acc0 = Vector256<long>.Zero; // vecs 0-3
+            var acc1 = Vector256<long>.Zero; // vecs 4-7
             for (int di = 0; di < 14; di++)
             {
                 var qv = Vector256.Create((int)q[di]);
                 var v8 = Vector128.Load(blockBase + di * 8);
                 var wide = Avx2.ConvertToVector256Int32(v8);
                 var diff = Avx2.Subtract(wide, qv);
-                acc = Avx2.Add(acc, Avx2.MultiplyLow(diff, diff));
+                var sq = Avx2.MultiplyLow(diff, diff); // int32 squares (each fits: max 4e8 < int.MaxValue)
+                acc0 = Avx2.Add(acc0, Avx2.ConvertToVector256Int64(sq.GetLower()));
+                acc1 = Avx2.Add(acc1, Avx2.ConvertToVector256Int64(sq.GetUpper()));
 
                 // Two partial-distance checkpoints. High-variance dims first → acc grows fast.
-                // Both are mathematically safe: partial ≤ full distance (all diffs² ≥ 0).
-                if ((di == 3 || di == 7) && bound < int.MaxValue)
+                if ((di == 3 || di == 7) && bound < long.MaxValue)
                 {
-                    var cmp = Avx2.CompareGreaterThan(Vector256.Create(bound), acc);
-                    if (Avx2.MoveMask(cmp.AsByte()) == 0) return false;
+                    var bv = Vector256.Create(bound);
+                    var any = Avx2.Or(
+                        Avx2.CompareGreaterThan(bv, acc0),
+                        Avx2.CompareGreaterThan(bv, acc1));
+                    if (Avx2.MoveMask(any.AsByte()) == 0) return false;
                 }
             }
-            Avx.Store(dptr, acc);
+            Avx.Store(dptr,     acc0);
+            Avx.Store(dptr + 4, acc1);
             return true;
         }
 #endif
 #if TARGET_ARM64
         if (AdvSimd.IsSupported)
         {
-            var acc_lo = Vector128<int>.Zero;
-            var acc_hi = Vector128<int>.Zero;
+            var acc0 = Vector128<long>.Zero; // vecs 0-1
+            var acc1 = Vector128<long>.Zero; // vecs 2-3
+            var acc2 = Vector128<long>.Zero; // vecs 4-5
+            var acc3 = Vector128<long>.Zero; // vecs 6-7
             for (int di = 0; di < 14; di++)
             {
                 var qv = Vector128.Create((int)q[di]);
@@ -264,20 +277,26 @@ public unsafe class SearchEngine
                 var hi = AdvSimd.SignExtendWideningUpper(v8);
                 var dlo = AdvSimd.Subtract(lo, qv);
                 var dhi = AdvSimd.Subtract(hi, qv);
-                acc_lo = AdvSimd.Add(acc_lo, AdvSimd.Multiply(dlo, dlo));
-                acc_hi = AdvSimd.Add(acc_hi, AdvSimd.Multiply(dhi, dhi));
+                var sqlo = AdvSimd.Multiply(dlo, dlo);
+                var sqhi = AdvSimd.Multiply(dhi, dhi);
+                acc0 = AdvSimd.Add(acc0, AdvSimd.SignExtendWideningLower(sqlo));
+                acc1 = AdvSimd.Add(acc1, AdvSimd.SignExtendWideningUpper(sqlo));
+                acc2 = AdvSimd.Add(acc2, AdvSimd.SignExtendWideningLower(sqhi));
+                acc3 = AdvSimd.Add(acc3, AdvSimd.SignExtendWideningUpper(sqhi));
             }
-            AdvSimd.Store(dptr,     acc_lo);
-            AdvSimd.Store(dptr + 4, acc_hi);
+            AdvSimd.Store(dptr,     acc0);
+            AdvSimd.Store(dptr + 2, acc1);
+            AdvSimd.Store(dptr + 4, acc2);
+            AdvSimd.Store(dptr + 6, acc3);
             return true;
         }
 #endif
         for (int i = 0; i < 8; i++) dptr[i] = 0;
         for (int di = 0; di < 14; di++)
         {
-            int qd = q[di];
+            long qd = q[di];
             short* dd = blockBase + di * 8;
-            for (int i = 0; i < 8; i++) { int diff = dd[i] - qd; dptr[i] += diff * diff; }
+            for (int i = 0; i < 8; i++) { long diff = dd[i] - qd; dptr[i] += diff * diff; }
         }
         return true;
     }
