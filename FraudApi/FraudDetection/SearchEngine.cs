@@ -145,7 +145,6 @@ public unsafe class SearchEngine
         fixed (float* cPtr = _centroids)
         fixed (float* qfPtr = queryF)
         {
-#if TARGET_X64
             if (Avx.IsSupported && Sse.IsSupported)
             {
                 var qv0 = Avx.LoadVector256(qfPtr);
@@ -173,7 +172,6 @@ public unsafe class SearchEngine
                 }
                 return;
             }
-#endif
             for (int ci = 0; ci < _k; ci++)
             {
                 if (hasExcluded && (excluded[ci >> 6] & (1UL << (ci & 63))) != 0) continue;
@@ -232,7 +230,6 @@ public unsafe class SearchEngine
     private static unsafe bool ProcessAllDims(Block* block, short* q, long* dptr, long bound)
     {
         short* blockBase = (short*)block;
-#if TARGET_X64
         if (Avx2.IsSupported)
         {
             var acc0 = Vector256<long>.Zero; // vecs 0-3
@@ -261,8 +258,6 @@ public unsafe class SearchEngine
             Avx.Store(dptr + 4, acc1);
             return true;
         }
-#endif
-#if TARGET_ARM64
         if (AdvSimd.IsSupported)
         {
             var acc0 = Vector128<long>.Zero; // vecs 0-1
@@ -290,7 +285,6 @@ public unsafe class SearchEngine
             AdvSimd.Store(dptr + 6, acc3);
             return true;
         }
-#endif
         for (int i = 0; i < 8; i++) dptr[i] = 0;
         for (int di = 0; di < 14; di++)
         {
