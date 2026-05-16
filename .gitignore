@@ -9,3 +9,7 @@ resources/dataset.bin
 resources/fastpath.bin
 resources/references.json.gz
 resources/references.jsonCLAUDE.md
+
+# Zig build artifacts
+lb/.zig-cache/
+lb/zig-out/

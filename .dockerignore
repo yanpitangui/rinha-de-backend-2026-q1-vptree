@@ -1,0 +1,13 @@
+.git/
+lb/
+*.md
+OPTIMIZATION_PLAN.md
+resources/references.json
+**/bin/
+**/obj/
+**/.zig-cache/
+.claude/
+test_sample.json
+docker-compose*.yml
+Dockerfile*
+nginx.conf

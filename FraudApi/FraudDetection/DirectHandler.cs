@@ -7,6 +7,21 @@ namespace FraudApi.FraudDetection;
 
 public static class DirectHandler
 {
+    internal static int ComputeIndex(ReadOnlySpan<byte> body)
+    {
+        Span<short> query = stackalloc short[16];
+        if (!TryVectorize(body, query, FraudHandler.MccRisk, FraudHandler.Norm))
+            return 0;
+
+        if (FraudHandler.FastPath is { } fp)
+        {
+            byte fpr = fp.TryLookup(query);
+            if (fpr != 0) return fpr - 1;
+        }
+
+        return FraudHandler.Engine.Search(query);
+    }
+
     public static Task Handle(HttpContext ctx)
     {
         if (ctx.Request.BodyReader.TryRead(out var readResult))

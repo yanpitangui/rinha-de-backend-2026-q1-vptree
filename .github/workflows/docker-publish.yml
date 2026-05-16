@@ -7,6 +7,7 @@ on:
 
 env:
   IMAGE: ghcr.io/yanpitangui/rinha-de-backend-2026-q1
+  IMAGE_LB: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-lb
 
 jobs:
   build:
@@ -34,7 +35,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push API
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -44,5 +45,18 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build and push LB
+        uses: docker/build-push-action@v6
+        with:
+          context: ./lb
+          file: ./Dockerfile.lb
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_LB }}:latest
+            ${{ env.IMAGE_LB }}:${{ github.sha }}
+          cache-from: type=gha,scope=lb
+          cache-to: type=gha,mode=max,scope=lb
