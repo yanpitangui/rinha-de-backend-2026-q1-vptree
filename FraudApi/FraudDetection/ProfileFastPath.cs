@@ -4,11 +4,11 @@ namespace FraudApi.FraudDetection;
 
 public sealed class ProfileFastPath
 {
-    // 22-bit key: booleans get 1 bit, continuous features get proportional bits.
-    // Sum = 22 → 4M entries × 4 bytes = 16 MB table.
+    // 22-bit key (sum=22 → 4M entries × 4B = 16 MiB): highest-variance dims get most bits.
+    // Dims 6 (km_from_last_tx) and 5 (minutes_since_last_tx) included — strongest fraud signal.
     // MUST stay in sync with FraudApi.PreProcessor/Program.cs BuildFastPath().
-    private static readonly int[] FeatureIndex = [0, 12,  2, 7, 8, 1, 9, 10, 11];
-    private static readonly int[] Bits         = [5,  4,  3, 3, 2, 2, 1,  1,  1];
+    private static readonly int[] FeatureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
+    private static readonly int[] Bits         = [5,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=22 → 4M entries × 4B = 16 MiB
 
     private static readonly int[] Shifts;
 

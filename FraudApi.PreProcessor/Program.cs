@@ -347,8 +347,8 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
 {
     // 22-bit key: booleans get 1 bit, continuous features get proportional bits.
     // MUST stay in sync with FraudApi/FraudDetection/ProfileFastPath.cs constants.
-    int[] featureIndex = [0, 12,  2, 7, 8, 1, 9, 10, 11];
-    int[] bits         = [5,  4,  3, 3, 2, 2, 1,  1,  1]; // sum=22 → 4M entries × 4 bytes = 16 MiB
+    int[] featureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
+    int[] bits         = [5,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=22 → 4M entries × 4 bytes = 16 MiB
 
     int nf = featureIndex.Length;
     int tableSize = 1 << bits.Sum();
