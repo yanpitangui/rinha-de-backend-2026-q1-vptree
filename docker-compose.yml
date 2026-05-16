@@ -1,6 +1,5 @@
 services:
   lb:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-lb:latest
     build:
       context: ./lb
       dockerfile: ../Dockerfile.lb
@@ -22,7 +21,6 @@ services:
           memory: "10MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -49,7 +47,6 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:latest
     build:
       context: .
       dockerfile: Dockerfile
