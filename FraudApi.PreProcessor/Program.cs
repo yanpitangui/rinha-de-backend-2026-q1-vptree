@@ -345,19 +345,18 @@ static float[] RunKMeans(short[] vecs, int[] sampleIdx, int k, int iters, string
 
 static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string resourcesPath)
 {
-    // Feature dims and bit allocations — must match ProfileFastPath.cs constants
-    int[] featureIndex = [0, 7, 10, 1, 9, 11, 12, 3];
-    int[] bits         = [4, 3,  6, 1, 3,  4, 1,  2]; // sum=24 → 16 MiB table
+    // 22-bit key: booleans get 1 bit, continuous features get proportional bits.
+    // MUST stay in sync with FraudApi/FraudDetection/ProfileFastPath.cs constants.
+    int[] featureIndex = [0, 12,  2, 7, 8, 1, 9, 10, 11];
+    int[] bits         = [5,  4,  3, 3, 2, 2, 1,  1,  1]; // sum=22 → 4M entries × 4 bytes = 16 MiB
 
     int nf = featureIndex.Length;
     int tableSize = 1 << bits.Sum();
 
-    // Compute cumulative bit shifts
     var shifts = new int[nf];
-    shifts[0] = 0;
     for (int f = 1; f < nf; f++) shifts[f] = shifts[f - 1] + bits[f - 1];
 
-    // Compute quantile edges per feature in int16 space
+    // Quantile edges per feature (int16 space)
     var edges = new short[nf][];
     for (int f = 0; f < nf; f++)
     {
@@ -377,64 +376,58 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
         }
     }
 
-    // Accumulate (count_legit | count_fraud) per bucket key
-    // ulong encoding: upper 32 bits = legit count, lower 32 bits = fraud count
+    // Count total and fraud per bucket.
+    // Packed ulong: upper 32 = total_count, lower 32 = fraud_count.
     var buckets = new Dictionary<uint, ulong>(1 << 20);
     for (int i = 0; i < total; i++)
     {
         uint key = 0;
         for (int f = 0; f < nf; f++)
-        {
-            short v = allVecs[i * 16 + featureIndex[f]];
-            int bin = FindBinS(edges[f], v);
-            key |= (uint)bin << shifts[f];
-        }
+            key |= (uint)FindBinS(edges[f], allVecs[i * 16 + featureIndex[f]]) << shifts[f];
 
-        ulong inc = allLabels[i] == 0 ? (1UL << 32) : 1UL; // legit → upper, fraud → lower
-        buckets[key] = buckets.TryGetValue(key, out var cur) ? cur + inc : inc;
+        ulong cur = buckets.TryGetValue(key, out var c) ? c : 0UL;
+        ulong fraudInc = allLabels[i]; // 1 if fraud, 0 if legit
+        buckets[key] = cur + (1UL << 32) + fraudInc;
     }
 
-    // Read env-var thresholds (defaults match the best C# competitor)
-    int kLegit = int.TryParse(Environment.GetEnvironmentVariable("FP_MIN_LEGIT"), out var kl) ? kl : 100;
-    int kFraud = int.TryParse(Environment.GetEnvironmentVariable("FP_MIN_FRAUD"), out var kf) ? kf : 400;
-
-    // Build dense byte table
-    var table = new byte[tableSize];
-    int pureLegiit = 0, pureFraud = 0;
+    // Build dense uint table: entry = (total << 16) | fraud, both capped at 65535.
+    // Thresholds are applied at runtime (env vars); we store raw counts here.
+    var table = new uint[tableSize];
     foreach (var kv in buckets)
     {
-        int legit = (int)(kv.Value >> 32);
-        int fraud = (int)(uint)kv.Value;
-        if (fraud == 0 && legit >= kLegit) { table[kv.Key] = 1; pureLegiit++; }
-        else if (legit == 0 && fraud >= kFraud) { table[kv.Key] = 2; pureFraud++; }
+        long totalL = (long)(kv.Value >> 32);
+        long fraudL = (long)(kv.Value & 0xFFFFFFFF);
+        uint packed = ((uint)Math.Min(totalL, 65535) << 16) | (uint)Math.Min(fraudL, 65535);
+        table[kv.Key] = packed;
     }
 
-    // Estimate hit rate from the reference data itself
-    long hits = 0;
-    for (int i = 0; i < total; i++)
+    // Log estimated hit rate using default runtime thresholds for reference.
+    const int defPureLegitMin = 5, defPureFraudMin = 10, defDomMin = 50;
+    long hitsPureLegit = 0, hitsPureFraud = 0, hitsDom = 0;
+    foreach (var kv in buckets)
     {
-        uint key = 0;
-        for (int f = 0; f < nf; f++)
-        {
-            short v = allVecs[i * 16 + featureIndex[f]];
-            key |= (uint)FindBinS(edges[f], v) << shifts[f];
-        }
-        if (table[key] != 0) hits++;
+        long totalL = (long)(kv.Value >> 32);
+        long fraudL = (long)(kv.Value & 0xFFFFFFFF);
+        long legitL = totalL - fraudL;
+        if (fraudL == 0 && totalL >= defPureLegitMin)  hitsPureLegit += totalL;
+        else if (legitL == 0 && totalL >= defPureFraudMin) hitsPureFraud += totalL;
+        else if ((fraudL <= 1 || legitL <= 1) && totalL >= defDomMin) hitsDom += totalL;
     }
-    Console.WriteLine($"  Pure-legit buckets: {pureLegiit}, pure-fraud: {pureFraud}");
-    Console.WriteLine($"  Estimated hit rate: {hits * 100.0 / total:F2}% ({hits}/{total})");
+    long totalHits = hitsPureLegit + hitsPureFraud + hitsDom;
+    Console.WriteLine($"  Fast-path coverage (default thresholds): {totalHits * 100.0 / total:F1}%  " +
+                      $"(pure-legit={hitsPureLegit}, pure-fraud={hitsPureFraud}, dominant={hitsDom})");
 
-    // Write fastpath.bin
+    // Write fastpath.bin — magic 0x46415332 ("FAS2"), edges, then uint table.
     var outputPath = Path.Combine(resourcesPath, "fastpath.bin");
     using var bw2 = new BinaryWriter(File.Create(outputPath));
-    bw2.Write(unchecked((int)0x46415354)); // magic "FAST"
+    bw2.Write(unchecked((int)0x46415332)); // "FAS2"
     for (int f = 0; f < nf; f++)
     {
         bw2.Write(edges[f].Length);
         foreach (var e in edges[f]) bw2.Write(e);
     }
     bw2.Write(tableSize);
-    bw2.Write(table);
+    foreach (var v in table) bw2.Write(v);
     Console.WriteLine($"  Written {outputPath} ({new FileInfo(outputPath).Length / 1024 / 1024} MiB)");
 }
 

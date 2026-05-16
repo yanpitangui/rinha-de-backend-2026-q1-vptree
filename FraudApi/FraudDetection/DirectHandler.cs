@@ -42,8 +42,11 @@ public static class DirectHandler
 
         if (!ok) return FraudHandler.Responses[0];
 
-        if (FraudHandler.FastPath is { } fp && fp.TryLookup(query) == 2)
-            return FraudHandler.Responses[5];
+        if (FraudHandler.FastPath is { } fp)
+        {
+            byte fpr = fp.TryLookup(query);
+            if (fpr != 0) return FraudHandler.Responses[fpr - 1];
+        }
 
         return FraudHandler.Responses[FraudHandler.Engine.Search(query)];
     }
