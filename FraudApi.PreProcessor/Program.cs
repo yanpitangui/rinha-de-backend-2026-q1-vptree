@@ -348,7 +348,7 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     // 22-bit key: booleans get 1 bit, continuous features get proportional bits.
     // MUST stay in sync with FraudApi/FraudDetection/ProfileFastPath.cs constants.
     int[] featureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
-    int[] bits         = [5,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=22 → 4M entries × 4 bytes = 16 MiB
+    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=23 → 8M entries × 2 bytes = 16 MiB
 
     int nf = featureIndex.Length;
     int tableSize = 1 << bits.Sum();
@@ -390,14 +390,16 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
         buckets[key] = cur + (1UL << 32) + fraudInc;
     }
 
-    // Build dense uint table: entry = (total << 16) | fraud, both capped at 65535.
+    // Build dense ushort table: entry = (legit << 8) | fraud, each capped independently at 255.
+    // Storing legit+fraud separately avoids precision loss when both exceed 255.
     // Thresholds are applied at runtime (env vars); we store raw counts here.
-    var table = new uint[tableSize];
+    var table = new ushort[tableSize];
     foreach (var kv in buckets)
     {
         long totalL = (long)(kv.Value >> 32);
         long fraudL = (long)(kv.Value & 0xFFFFFFFF);
-        uint packed = ((uint)Math.Min(totalL, 65535) << 16) | (uint)Math.Min(fraudL, 65535);
+        long legitL = totalL - fraudL;
+        ushort packed = (ushort)(((uint)Math.Min(legitL, 255) << 8) | (uint)Math.Min(fraudL, 255));
         table[kv.Key] = packed;
     }
 
@@ -420,7 +422,7 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     // Write fastpath.bin — magic 0x46415332 ("FAS2"), edges, then uint table.
     var outputPath = Path.Combine(resourcesPath, "fastpath.bin");
     using var bw2 = new BinaryWriter(File.Create(outputPath));
-    bw2.Write(unchecked((int)0x46415332)); // "FAS2"
+    bw2.Write(unchecked((int)0x46415333)); // "FAS3"
     for (int f = 0; f < nf; f++)
     {
         bw2.Write(edges[f].Length);
@@ -428,7 +430,7 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     }
     bw2.Write(tableSize);
     foreach (var v in table) bw2.Write(v);
-    Console.WriteLine($"  Written {outputPath} ({new FileInfo(outputPath).Length / 1024 / 1024} MiB)");
+    Console.WriteLine($"  Written {outputPath} ({new FileInfo(outputPath).Length / 1024.0 / 1024.0:F1} MiB)");
 }
 
 static int FindBinS(short[] edges, short v)

@@ -4,11 +4,11 @@ namespace FraudApi.FraudDetection;
 
 public sealed class ProfileFastPath
 {
-    // 22-bit key (sum=22 → 4M entries × 4B = 16 MiB): highest-variance dims get most bits.
+    // 23-bit key (sum=23 → 8M entries × 2B = 16 MiB): highest-variance dims get most bits.
     // Dims 6 (km_from_last_tx) and 5 (minutes_since_last_tx) included — strongest fraud signal.
     // MUST stay in sync with FraudApi.PreProcessor/Program.cs BuildFastPath().
     private static readonly int[] FeatureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
-    private static readonly int[] Bits         = [5,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=22 → 4M entries × 4B = 16 MiB
+    private static readonly int[] Bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=23 → 8M entries × 2B = 16 MiB
 
     private static readonly int[] Shifts;
 
@@ -20,8 +20,8 @@ public sealed class ProfileFastPath
     }
 
     private readonly short[][] _edges;
-    // entry = (total_count << 16) | fraud_count  (each field capped at 65535)
-    private readonly uint[] _table;
+    // entry = (legit_count << 8) | fraud_count  (each field capped at 255)
+    private readonly ushort[] _table;
 
     // Runtime-configurable thresholds (env vars, tunable without rebuild).
     private readonly int _pureLegitMin; // pure-legit  : fraud==0 AND total >= this
@@ -29,7 +29,7 @@ public sealed class ProfileFastPath
     private readonly int _domLegitMin;  // dominant legit: fraud<=1 AND total >= this
     private readonly int _domFraudMin;  // dominant fraud: legit<=1 AND total >= this
 
-    private ProfileFastPath(short[][] edges, uint[] table)
+    private ProfileFastPath(short[][] edges, ushort[] table)
     {
         _edges = edges;
         _table = table;
@@ -46,8 +46,8 @@ public sealed class ProfileFastPath
     {
         using var br = new BinaryReader(File.OpenRead(path));
         int magic = br.ReadInt32();
-        if (magic != unchecked((int)0x46415332))
-            throw new InvalidDataException($"fastpath.bin: expected magic FAS2, got 0x{magic:X8}");
+        if (magic != unchecked((int)0x46415333))
+            throw new InvalidDataException($"fastpath.bin: expected magic FAS3, got 0x{magic:X8}");
 
         int nf = FeatureIndex.Length;
         var edges = new short[nf][];
@@ -60,9 +60,9 @@ public sealed class ProfileFastPath
         }
 
         int tableSize = br.ReadInt32();
-        var table = new uint[tableSize];
+        var table = new ushort[tableSize];
         for (int i = 0; i < tableSize; i++)
-            table[i] = br.ReadUInt32();
+            table[i] = br.ReadUInt16();
         return new ProfileFastPath(edges, table);
     }
 
@@ -75,12 +75,12 @@ public sealed class ProfileFastPath
         for (int f = 0; f < FeatureIndex.Length; f++)
             key |= (uint)FindBin(_edges[f], query[FeatureIndex[f]]) << Shifts[f];
 
-        uint entry = _table[key];
+        ushort entry = _table[key];
         if (entry == 0) return 0;
 
-        int total = (int)(entry >> 16);
-        int fraud = (int)(entry & 0xFFFF);
-        int legit = total - fraud;
+        int fraud = entry & 0xFF;
+        int legit = entry >> 8;
+        int total = legit + fraud;
 
         if (fraud == 0)
         {
