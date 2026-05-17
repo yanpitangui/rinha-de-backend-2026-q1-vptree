@@ -37,12 +37,13 @@ public sealed unsafe class MmapData
             var dimOrder = new int[14];
             new ReadOnlySpan<int>(dimOrderPtr, 14).CopyTo(dimOrder);
 
-            // centroids: after dimOrder (offset 16 + 14*4 = 72)
+            // centroids column-major [dim][centroid]: after dimOrder (offset 16 + 14*4 = 72)
             float* centroidPtr = (float*)(ptr + 72);
-            var centroids = new float[k * 16];
-            new ReadOnlySpan<float>(centroidPtr, k * 16).CopyTo(centroids);
+            int centroidFloats = 14 * k;
+            var centroids = new float[centroidFloats];
+            new ReadOnlySpan<float>(centroidPtr, centroidFloats).CopyTo(centroids);
 
-            int* blockStartPtr = (int*)(centroidPtr + k * 16);
+            int* blockStartPtr = (int*)(centroidPtr + centroidFloats);
             var clusterBlockStart = new int[k];
             new ReadOnlySpan<int>(blockStartPtr, k).CopyTo(clusterBlockStart);
 

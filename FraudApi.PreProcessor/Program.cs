@@ -180,8 +180,11 @@ bw.Write(K);
 // DimOrder (14 ints) — must match MmapData.cs offset 16
 foreach (var d in dimOrder) bw.Write(d);
 
-// Centroids (K * 16 floats)
-for (int i = 0; i < K * 16; i++) bw.Write(centroids[i]);
+// Centroids column-major: [dim][centroid] → Dims * K floats
+// Allows AVX FMA scan of 8 centroids per load (sequential memory, no horizontal reduction)
+for (int d = 0; d < Dims; d++)
+    for (int k = 0; k < K; k++)
+        bw.Write(centroids[k * 16 + d]);
 
 // Cluster metadata
 for (int k = 0; k < K; k++) bw.Write(clusterBlockStart[k]);

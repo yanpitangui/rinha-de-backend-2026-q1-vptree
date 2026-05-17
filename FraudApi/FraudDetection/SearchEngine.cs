@@ -19,7 +19,10 @@ public unsafe class SearchEngine
     private readonly int[] _clusterBlockLen;
     private readonly short* _bboxMin;
     private readonly short* _bboxMax;
-    private readonly int[] _dimOrder; // variance-sorted dim indices, high→low
+    private readonly int[] _dimOrder;
+
+    // Reciprocal of quantization scale — used in block scanning to convert int16→float
+    private const float InvScale = 1.0f / Vectorizer.Scale;
 
     public SearchEngine(
         Block* blocks, byte* labels,
@@ -45,6 +48,7 @@ public unsafe class SearchEngine
     [SkipLocalsInit]
     public int Search(Span<short> query)
     {
+        // queryF in int16-scale (raw values as float) — matches centroid space
         Span<float> queryF = stackalloc float[16];
         for (int d = 0; d < 14; d++) queryF[d] = query[d];
 
@@ -53,39 +57,37 @@ public unsafe class SearchEngine
         probeDists.Fill(float.MaxValue);
         FindNearestClusters(queryF, probeIdx, probeDists, ReadOnlySpan<ulong>.Empty);
 
-        Span<long> best = stackalloc long[5];
+        Span<float> best = stackalloc float[5];
         Span<byte> bestLabels = stackalloc byte[5];
-        best.Fill(long.MaxValue);
-        long bound = long.MaxValue;
+        best.Fill(float.MaxValue);
+        float bound = float.MaxValue;
 
+        // Reorder query dims by variance (high→low) for early-exit effectiveness
         Span<short> queryOrd = stackalloc short[16];
         for (int di = 0; di < 14; di++) queryOrd[di] = query[_dimOrder[di]];
 
-        fixed (short* qOrdPtr = queryOrd)
+        ScanProbes(queryOrd, probeIdx, ref bound, best, bestLabels);
+
+        if (_nprobeRetry > 0)
         {
-            ScanProbes(qOrdPtr, queryOrd, probeIdx, ref bound, best, bestLabels);
+            int fc = 0;
+            for (int i = 0; i < 5; i++) fc += bestLabels[i];
 
-            if (_nprobeRetry > 0)
+            if (fc >= 1 && fc <= 4)
             {
-                int fc = 0;
-                for (int i = 0; i < 5; i++) fc += bestLabels[i];
+                int words = (_k + 63) >> 6;
+                Span<ulong> visited = stackalloc ulong[words];
+                visited.Clear();
+                for (int i = 0; i < _nprobe; i++)
+                    visited[probeIdx[i] >> 6] |= 1UL << (probeIdx[i] & 63);
 
-                if (fc >= 1 && fc <= 4)
-                {
-                    int words = (_k + 63) >> 6;
-                    Span<ulong> visited = stackalloc ulong[words];
-                    visited.Clear();
-                    for (int i = 0; i < _nprobe; i++)
-                        visited[probeIdx[i] >> 6] |= 1UL << (probeIdx[i] & 63);
-
-                    // fc∈{2,3} straddles approval boundary — use exhaust budget
-                    int extraProbes = (fc == 2 || fc == 3) ? _nprobeExhaust : _nprobeRetry;
-                    Span<int> retryIdx = stackalloc int[extraProbes];
-                    Span<float> retryDists = stackalloc float[extraProbes];
-                    retryDists.Fill(float.MaxValue);
-                    FindNearestClusters(queryF, retryIdx, retryDists, visited);
-                    ScanProbes(qOrdPtr, queryOrd, retryIdx, ref bound, best, bestLabels);
-                }
+                // fc∈{2,3} straddles the approval boundary — exhaust more clusters
+                int extraProbes = (fc == 2 || fc == 3) ? _nprobeExhaust : _nprobeRetry;
+                Span<int> retryIdx = stackalloc int[extraProbes];
+                Span<float> retryDists = stackalloc float[extraProbes];
+                retryDists.Fill(float.MaxValue);
+                FindNearestClusters(queryF, retryIdx, retryDists, visited);
+                ScanProbes(queryOrd, retryIdx, ref bound, best, bestLabels);
             }
         }
 
@@ -95,17 +97,20 @@ public unsafe class SearchEngine
     }
 
     [SkipLocalsInit]
-    private void ScanProbes(short* qPtr, Span<short> query, Span<int> probeIdx,
-        ref long bound, Span<long> best, Span<byte> bestLabels)
+    private void ScanProbes(Span<short> queryOrd, Span<int> probeIdx,
+        ref float bound, Span<float> best, Span<byte> bestLabels)
     {
+        // Precompute normalized float query (variance order, [0,1] scale) once per Search call
+        float* qf = stackalloc float[16];
+        for (int di = 0; di < 14; di++) qf[di] = queryOrd[di] * InvScale;
+
+        float* dptr = stackalloc float[8];
+
         int n = probeIdx.Length;
-        // Align to 32 bytes so AVX2 store/load never fault on aligned variants.
-        long* dptrRaw = stackalloc long[16];
-        long* dptr = (long*)(((nint)dptrRaw + 31) & ~31);
         for (int pi = 0; pi < n; pi++)
         {
             int ci = probeIdx[pi];
-            if (bound < long.MaxValue && BboxExceedsOrEquals(query, ci, bound)) continue;
+            if (bound < float.MaxValue && BboxExceedsOrEquals(queryOrd, ci, bound)) continue;
 
             int bStart = _clusterBlockStart[ci];
             int bEnd   = bStart + _clusterBlockLen[ci];
@@ -114,15 +119,17 @@ public unsafe class SearchEngine
                 if (Sse.IsSupported && b + 8 < bEnd)
                     Sse.Prefetch0(_blocks + b + 8);
 
-                if (!ProcessAllDims(_blocks + b, qPtr, dptr, bound)) continue;
-                bound = UpdateTopK(dptr, best, bestLabels, b * 8, bound);
+                if (!ProcessAllDims(_blocks + b, qf, dptr, bound)) continue;
+                UpdateTopK(dptr, best, bestLabels, b * 8, ref bound);
             }
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool BboxExceedsOrEquals(Span<short> query, int ci, long bound)
+    private bool BboxExceedsOrEquals(Span<short> query, int ci, float bound)
     {
+        // Bbox pruning stays in int16-scale; convert float bound to int16^2 space
+        long boundInt = (long)(bound * ((double)Vectorizer.Scale * Vectorizer.Scale));
         long lb = 0;
         int bboxBase = ci * 14;
         for (int d = 0; d < 14; d++)
@@ -132,56 +139,68 @@ public unsafe class SearchEngine
             int hi = _bboxMax[bboxBase + d];
             if (q < lo) { long diff = lo - q; lb += diff * diff; }
             else if (q > hi) { long diff = q - hi; lb += diff * diff; }
-            if (lb > bound) return true;
+            if (lb > boundInt) return true;
         }
         return false;
     }
 
+    // Column-major centroid layout: _centroids[dim * _k + ci]
+    // Allows FMA scan of 8 centroids per AVX load (sequential memory, no horizontal sum).
+    [SkipLocalsInit]
     private void FindNearestClusters(Span<float> queryF, Span<int> probeIdx, Span<float> probeDists, ReadOnlySpan<ulong> excluded)
     {
         int n = probeIdx.Length;
-        bool hasExcluded = excluded.Length > 0;
+        float* acc = stackalloc float[_k];
 
         fixed (float* cPtr = _centroids)
-        fixed (float* qfPtr = queryF)
         {
-            if (Avx.IsSupported && Sse.IsSupported)
+            if (Avx.IsSupported)
             {
-                var qv0 = Avx.LoadVector256(qfPtr);
-                var qv1 = Avx.LoadVector256(qfPtr + 8);
-
-                for (int ci = 0; ci < _k; ci++)
+                // Initialize acc with (query[0] - centroid[0][ci])^2 for all ci
+                float* base0 = cPtr;
+                var qv0 = Vector256.Create(queryF[0]);
+                for (int ci = 0; ci < _k; ci += 8)
                 {
-                    if (hasExcluded && (excluded[ci >> 6] & (1UL << (ci & 63))) != 0) continue;
-
-                    float* c = cPtr + ci * 16;
-                    var d0 = Avx.Subtract(qv0, Avx.LoadVector256(c));
-                    var d1 = Avx.Subtract(qv1, Avx.LoadVector256(c + 8));
-                    d0 = Avx.Multiply(d0, d0);
-                    d1 = Avx.Multiply(d1, d1);
-                    var sum = Avx.Add(d0, d1);
-                    var lo128 = sum.GetLower();
-                    var hi128 = sum.GetUpper();
-                    var s = Sse.Add(lo128, hi128);
-                    s = Sse.Add(s, Sse.MoveHighToLow(s, s));
-                    s = Sse.AddScalar(s, Sse.Shuffle(s, s, 0b_00_00_00_01));
-                    float dist = s.ToScalar();
-
-                    if (dist < probeDists[n - 1])
-                        InsertSorted(probeIdx, probeDists, ci, dist, n);
+                    var dif = Avx.Subtract(qv0, Avx.LoadVector256(base0 + ci));
+                    Avx.Store(acc + ci, Avx.Multiply(dif, dif));
                 }
-                return;
+
+                // FMA-accumulate dims 1–13
+                for (int d = 1; d < 14; d++)
+                {
+                    float* baseD = cPtr + d * _k;
+                    var qvd = Vector256.Create(queryF[d]);
+                    for (int ci = 0; ci < _k; ci += 8)
+                    {
+                        var dif = Avx.Subtract(qvd, Avx.LoadVector256(baseD + ci));
+                        var cur = Avx.LoadVector256(acc + ci);
+                        Avx.Store(acc + ci,
+                            Fma.IsSupported
+                                ? Fma.MultiplyAdd(dif, dif, cur)
+                                : Avx.Add(cur, Avx.Multiply(dif, dif)));
+                    }
+                }
             }
+            else
+            {
+                // Scalar fallback
+                for (int ci = 0; ci < _k; ci++) acc[ci] = 0f;
+                for (int d = 0; d < 14; d++)
+                {
+                    float* baseD = cPtr + d * _k;
+                    float qd = queryF[d];
+                    for (int ci = 0; ci < _k; ci++) { float dif = qd - baseD[ci]; acc[ci] += dif * dif; }
+                }
+            }
+
+            // Pick top-n (skip excluded clusters from prior probes)
+            bool hasExcluded = excluded.Length > 0;
             for (int ci = 0; ci < _k; ci++)
             {
                 if (hasExcluded && (excluded[ci >> 6] & (1UL << (ci & 63))) != 0) continue;
-
-                float d = 0;
-                float* c = cPtr + ci * 16;
-                for (int dim = 0; dim < 14; dim++) { float diff = queryF[dim] - c[dim]; d += diff * diff; }
-
-                if (d < probeDists[n - 1])
-                    InsertSorted(probeIdx, probeDists, ci, d, n);
+                float dist = acc[ci];
+                if (dist < probeDists[n - 1])
+                    InsertSorted(probeIdx, probeDists, ci, dist, n);
             }
         }
     }
@@ -201,11 +220,11 @@ public unsafe class SearchEngine
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe long UpdateTopK(long* dptr, Span<long> best, Span<byte> bestLabels, int labelBase, long bound)
+    private unsafe void UpdateTopK(float* dptr, Span<float> best, Span<byte> bestLabels, int labelBase, ref float bound)
     {
         for (int i = 0; i < 8; i++)
         {
-            long d = dptr[i];
+            float d = dptr[i];
             if (d >= bound) continue;
 
             int pos = 3;
@@ -219,78 +238,80 @@ public unsafe class SearchEngine
             bestLabels[pos + 1] = _labels[labelBase + i];
             bound = best[4];
         }
-        return bound;
     }
 
-    // Returns false if partial-distance early exit fired (block can be skipped).
-    // q and blockBase are both in variance order (reordered at call site once per query).
-    // Accumulates into long to avoid int32 overflow: max dist = 14 * (2*Scale)^2 = 5.6e9 > int.MaxValue.
+    // Returns false when partial-distance early exit fires (all 8 lanes exceed bound).
+    // qf is variance-ordered, normalized to [0,1]. Uses FMA where available.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     [SkipLocalsInit]
-    private static unsafe bool ProcessAllDims(Block* block, short* q, long* dptr, long bound)
+    private static unsafe bool ProcessAllDims(Block* block, float* qf, float* dptr, float bound)
     {
         short* blockBase = (short*)block;
+
         if (Avx2.IsSupported)
         {
-            var acc0 = Vector256<long>.Zero; // vecs 0-3
-            var acc1 = Vector256<long>.Zero; // vecs 4-7
+            var scale = Vector256.Create(InvScale);
+            var acc = Vector256<float>.Zero;
+
             for (int di = 0; di < 14; di++)
             {
-                var qv = Vector256.Create((int)q[di]);
-                var v8 = Vector128.Load(blockBase + di * 8);
-                var wide = Avx2.ConvertToVector256Int32(v8);
-                var diff = Avx2.Subtract(wide, qv);
-                var sq = Avx2.MultiplyLow(diff, diff); // int32 squares (each fits: max 4e8 < int.MaxValue)
-                acc0 = Avx2.Add(acc0, Avx2.ConvertToVector256Int64(sq.GetLower()));
-                acc1 = Avx2.Add(acc1, Avx2.ConvertToVector256Int64(sq.GetUpper()));
+                var qv  = Vector256.Create(qf[di]);
+                var v8  = Vector128.Load(blockBase + di * 8);
+                var vf  = Avx.Multiply(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(v8)), scale);
+                var dif = Avx.Subtract(vf, qv);
 
-                // Two partial-distance checkpoints. High-variance dims first → acc grows fast.
-                if ((di == 3 || di == 7) && bound < long.MaxValue)
+                acc = Fma.IsSupported
+                    ? Fma.MultiplyAdd(dif, dif, acc)
+                    : Avx.Add(acc, Avx.Multiply(dif, dif));
+
+                // Two partial-distance checkpoints; highest-variance dims first → acc grows fast
+                if ((di == 3 || di == 7) && bound < float.MaxValue)
                 {
-                    var bv = Vector256.Create(bound);
-                    var any = Avx2.Or(
-                        Avx2.CompareGreaterThan(bv, acc0),
-                        Avx2.CompareGreaterThan(bv, acc1));
-                    if (Avx2.MoveMask(any.AsByte()) == 0) return false;
+                    if (Avx.MoveMask(Avx.CompareLessThan(acc, Vector256.Create(bound))) == 0)
+                        return false;
                 }
             }
-            Avx.Store(dptr,     acc0);
-            Avx.Store(dptr + 4, acc1);
+
+            Avx.Store(dptr, acc);
             return true;
         }
+
         if (AdvSimd.IsSupported)
         {
-            var acc0 = Vector128<long>.Zero; // vecs 0-1
-            var acc1 = Vector128<long>.Zero; // vecs 2-3
-            var acc2 = Vector128<long>.Zero; // vecs 4-5
-            var acc3 = Vector128<long>.Zero; // vecs 6-7
+            var scale128 = Vector128.Create(InvScale);
+            var acc0 = Vector128<float>.Zero;
+            var acc1 = Vector128<float>.Zero;
+
             for (int di = 0; di < 14; di++)
             {
-                var qv = Vector128.Create((int)q[di]);
-                var v8 = AdvSimd.LoadVector128(blockBase + di * 8);
-                var lo = AdvSimd.SignExtendWideningLower(v8.GetLower());
-                var hi = AdvSimd.SignExtendWideningUpper(v8);
-                var dlo = AdvSimd.Subtract(lo, qv);
-                var dhi = AdvSimd.Subtract(hi, qv);
-                var sqlo = AdvSimd.Multiply(dlo, dlo);
-                var sqhi = AdvSimd.Multiply(dhi, dhi);
-                acc0 = AdvSimd.Add(acc0, AdvSimd.SignExtendWideningLower(sqlo.GetLower()));
-                acc1 = AdvSimd.Add(acc1, AdvSimd.SignExtendWideningUpper(sqlo));
-                acc2 = AdvSimd.Add(acc2, AdvSimd.SignExtendWideningLower(sqhi.GetLower()));
-                acc3 = AdvSimd.Add(acc3, AdvSimd.SignExtendWideningUpper(sqhi));
+                var qv   = Vector128.Create(qf[di]);
+                var v8   = AdvSimd.LoadVector128(blockBase + di * 8);
+                var lo32 = AdvSimd.SignExtendWideningLower(v8.GetLower());
+                var hi32 = AdvSimd.SignExtendWideningUpper(v8);
+                var lof  = AdvSimd.Multiply(AdvSimd.ConvertToSingle(lo32), scale128);
+                var hif  = AdvSimd.Multiply(AdvSimd.ConvertToSingle(hi32), scale128);
+                var dlo  = AdvSimd.Subtract(lof, qv);
+                var dhi  = AdvSimd.Subtract(hif, qv);
+                acc0 = AdvSimd.FusedMultiplyAdd(acc0, dlo, dlo);
+                acc1 = AdvSimd.FusedMultiplyAdd(acc1, dhi, dhi);
             }
+
             AdvSimd.Store(dptr,     acc0);
-            AdvSimd.Store(dptr + 2, acc1);
-            AdvSimd.Store(dptr + 4, acc2);
-            AdvSimd.Store(dptr + 6, acc3);
+            AdvSimd.Store(dptr + 4, acc1);
             return true;
         }
-        for (int i = 0; i < 8; i++) dptr[i] = 0;
+
+        // Scalar fallback
+        for (int i = 0; i < 8; i++) dptr[i] = 0f;
         for (int di = 0; di < 14; di++)
         {
-            long qd = q[di];
+            float qd = qf[di];
             short* dd = blockBase + di * 8;
-            for (int i = 0; i < 8; i++) { long diff = dd[i] - qd; dptr[i] += diff * diff; }
+            for (int i = 0; i < 8; i++)
+            {
+                float d = dd[i] * InvScale - qd;
+                dptr[i] += d * d;
+            }
         }
         return true;
     }
