@@ -31,9 +31,14 @@ public static class RawServer
     private const int SolSocket = 1;
     private const int ScmRights = 1;
     private const int MsgNosignal = 0x4000;
+    private const int IpprotoTcp = 6;
+    private const int TcpNodelay = 1;
 
     [DllImport("libc", SetLastError = true)]
     private static extern unsafe nint recvmsg(int sockfd, MsgHdr* msg, int flags);
+
+    [DllImport("libc")]
+    private static extern unsafe int setsockopt(int sockfd, int level, int optname, int* optval, uint optlen);
 
     [DllImport("libc", SetLastError = true)]
     private static extern unsafe int recv(int sockfd, byte* buf, nuint len, int flags);
@@ -121,7 +126,9 @@ public static class RawServer
 
     private static unsafe void HandleClient(int fd)
     {
-        // 4 KB on stack — enough for any competition request (~400-800 bytes typical)
+        int one = 1;
+        setsockopt(fd, IpprotoTcp, TcpNodelay, &one, 4);
+
         const int BufSize = 4096;
         byte* buf = stackalloc byte[BufSize];
         int filled = 0;
@@ -194,12 +201,13 @@ public static class RawServer
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe int ParseContentLength(byte* buf, int hdrEnd)
     {
-        // Scan headers for "Content-Length: "
-        var hdrs = new ReadOnlySpan<byte>(buf, hdrEnd);
+        // POST /fraud-score HTTP/1.1\r\n = 29 bytes; skip to start of headers
+        const int RequestLineLen = 29;
+        var hdrs = new ReadOnlySpan<byte>(buf + RequestLineLen, hdrEnd - RequestLineLen);
         var key = "Content-Length: "u8;
         int idx = hdrs.IndexOf(key);
         if (idx < 0) return -1;
-        int pos = idx + key.Length;
+        int pos = RequestLineLen + idx + key.Length;
         int result = 0;
         while (pos < hdrEnd && buf[pos] >= '0' && buf[pos] <= '9')
             result = result * 10 + buf[pos++] - '0';

@@ -7,6 +7,9 @@ namespace FraudApi.FraudDetection;
 
 public static class DirectHandler
 {
+    private static readonly int[] s_dowTab = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    private static readonly int[] s_doy    = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
     internal static int ComputeIndex(ReadOnlySpan<byte> body)
     {
         Span<short> query = stackalloc short[16];
@@ -290,7 +293,7 @@ public static class DirectHandler
             }
         }
         dst[11] = knownMerchant ? (short)0 : (short)Scale;
-        dst[12] = Q(mccRisk.GetValueOrDefault(mcc, 0.5));
+        dst[12] = FraudHandler.MccLut[mcc];
         dst[13] = Q(Clamp(merchantAvgAmount / n.MaxMerchantAvgAmount));
         dst[14] = 0;
         dst[15] = 0;
@@ -310,8 +313,24 @@ public static class DirectHandler
         int mo = (s[5] - '0') * 10 + (s[6] - '0');
         int d  = (s[8] - '0') * 10 + (s[9] - '0');
         int h  = (s[11] - '0') * 10 + (s[12] - '0');
-        int dw = ((int)new DateTime(y, mo, d).DayOfWeek + 6) % 7;
+        int dw = (DayOfWeekFast(y, mo, d) + 6) % 7;
         return ((byte)h, (byte)dw);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int DayOfWeekFast(int y, int m, int d)
+    {
+        if (m < 3) y--;
+        return (y + y / 4 - y / 100 + y / 400 + s_dowTab[m - 1] + d) % 7;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long DaysFromEpoch(int y, int m, int d)
+    {
+        int y1 = y - 1;
+        bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        return 365L * y1 + y1 / 4 - y1 / 100 + y1 / 400
+             + s_doy[m - 1] + (leap && m > 2 ? 1 : 0) + d - 1;
     }
 
     // Returns elapsed minutes between two "YYYY-MM-DDTHH:MM:SSZ" timestamps (from - to).
@@ -333,11 +352,12 @@ public static class DirectHandler
         int h   = (s[11] - '0') * 10 + (s[12] - '0');
         int mi  = (s[14] - '0') * 10 + (s[15] - '0');
         int sec = (s[17] - '0') * 10 + (s[18] - '0');
-        return new DateTime(y, mo, d, h, mi, sec, DateTimeKind.Utc).Ticks;
+        return DaysFromEpoch(y, mo, d) * 864_000_000_000L
+             + h * 36_000_000_000L + mi * 600_000_000L + sec * 10_000_000L;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static short Q(double v)
+    internal static short Q(double v)
     {
         var q = (int)Math.Round(v * Vectorizer.Scale);
         return q > short.MaxValue ? short.MaxValue : q < short.MinValue ? short.MinValue : (short)q;

@@ -5,6 +5,9 @@ namespace FraudApi.Data;
 
 public sealed unsafe class MmapData
 {
+    [DllImport("libc")] private static extern int madvise(void* addr, nuint length, int advice);
+    private const int MadvHugePage = 14;
+
     public Block* Blocks;
     public byte* Labels;
     public short* BboxMin; // K * 14 shorts
@@ -25,6 +28,15 @@ public sealed unsafe class MmapData
         var data = GC.AllocateUninitializedArray<byte>(fileSize, pinned: true);
         using var fs = File.OpenRead(path);
         fs.ReadExactly(data);
+
+        // Hugepages: collapse 4KB→2MB pages, reduce TLB pressure on 90MB dataset
+        fixed (byte* p = data)
+        {
+            madvise(p, (nuint)fileSize, MadvHugePage);
+            // Prefault: touch every 4KB boundary to avoid page faults during serving
+            for (long i = 0; i < fileSize; i += 4096)
+                _ = p[i];
+        }
 
         fixed (byte* ptr = &MemoryMarshal.GetArrayDataReference(data))
         {

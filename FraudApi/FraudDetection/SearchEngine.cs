@@ -100,17 +100,21 @@ public unsafe class SearchEngine
     private void ScanProbes(Span<short> queryOrd, Span<int> probeIdx,
         ref float bound, Span<float> best, Span<byte> bestLabels)
     {
-        // Precompute normalized float query (variance order, [0,1] scale) once per Search call
         float* qf = stackalloc float[16];
         for (int di = 0; di < 14; di++) qf[di] = queryOrd[di] * InvScale;
 
         float* dptr = stackalloc float[8];
 
+        // Precompute bound in int16-squared space to avoid per-cluster float→long conversion
+        long boundInt = bound < float.MaxValue
+            ? (long)(bound * ((double)Vectorizer.Scale * Vectorizer.Scale))
+            : long.MaxValue;
+
         int n = probeIdx.Length;
         for (int pi = 0; pi < n; pi++)
         {
             int ci = probeIdx[pi];
-            if (bound < float.MaxValue && BboxExceedsOrEquals(queryOrd, ci, bound)) continue;
+            if (boundInt < long.MaxValue && BboxExceedsOrEquals(queryOrd, ci, boundInt)) continue;
 
             int bStart = _clusterBlockStart[ci];
             int bEnd   = bStart + _clusterBlockLen[ci];
@@ -120,16 +124,17 @@ public unsafe class SearchEngine
                     Sse.Prefetch0(_blocks + b + 8);
 
                 if (!ProcessAllDims(_blocks + b, qf, dptr, bound)) continue;
+                float prevBound = bound;
                 UpdateTopK(dptr, best, bestLabels, b * 8, ref bound);
+                if (bound != prevBound)
+                    boundInt = (long)(bound * ((double)Vectorizer.Scale * Vectorizer.Scale));
             }
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool BboxExceedsOrEquals(Span<short> query, int ci, float bound)
+    private bool BboxExceedsOrEquals(Span<short> query, int ci, long boundInt)
     {
-        // Bbox pruning stays in int16-scale; convert float bound to int16^2 space
-        long boundInt = (long)(bound * ((double)Vectorizer.Scale * Vectorizer.Scale));
         long lb = 0;
         int bboxBase = ci * 14;
         for (int d = 0; d < 14; d++)

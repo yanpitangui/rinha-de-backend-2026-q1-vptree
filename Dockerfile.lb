@@ -1,8 +1,5 @@
-FROM alpine:3.21 AS builder
-RUN apk add --no-cache curl xz tar
-RUN curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
-    | tar -xJ -C /opt --strip-components=1
-ENV PATH="/opt:$PATH"
+FROM alpine:edge AS builder
+RUN apk add --no-cache zig
 
 WORKDIR /app
 COPY . .

@@ -7,6 +7,7 @@ public static class FraudHandler
 {
     public static SearchEngine Engine = default!;
     public static Dictionary<int, double> MccRisk = default!;
+    public static short[] MccLut = default!;
     public static NormalizationConfig Norm = default!;
     public static byte[][] Responses = default!;
     public static ProfileFastPath? FastPath;

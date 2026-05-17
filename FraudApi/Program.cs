@@ -47,9 +47,27 @@ FraudHandler.MccRisk = mccRisk;
 FraudHandler.Norm = normalization;
 FraudHandler.Responses = BuildResponses();
 
+var mccLut = new short[10000];
+Array.Fill(mccLut, DirectHandler.Q(0.5));
+foreach (var kv in mccRisk)
+    if ((uint)kv.Key < 10000u)
+        mccLut[kv.Key] = DirectHandler.Q(kv.Value);
+FraudHandler.MccLut = mccLut;
+
 var fastPathFile = Path.Combine(resourcesPath, "fastpath.bin");
 if (File.Exists(fastPathFile))
     FraudHandler.FastPath = ProfileFastPath.Load(fastPathFile);
+
+// Warmup: prime branch predictor + CPU caches before serving
+{
+    var rng = new Random(42);
+    Span<short> q = stackalloc short[16];
+    for (int i = 0; i < 200; i++)
+    {
+        for (int d = 0; d < 14; d++) q[d] = (short)rng.Next(0, 10001);
+        FraudHandler.Engine.Search(q);
+    }
+}
 
 var socketPath = $"/sockets/{System.Net.Dns.GetHostName()}.sock";
 RawServer.Run(socketPath);
