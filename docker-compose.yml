@@ -7,8 +7,6 @@ services:
       - "9999:9999"
     volumes:
       - uds-sockets:/sockets
-    security_opt:
-      - seccomp:unconfined
     depends_on:
       api1:
         condition: service_healthy
@@ -25,8 +23,6 @@ services:
       context: .
       dockerfile: Dockerfile
     hostname: api1
-    security_opt:
-      - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-16}
@@ -51,8 +47,6 @@ services:
       context: .
       dockerfile: Dockerfile
     hostname: api2
-    security_opt:
-      - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-16}
