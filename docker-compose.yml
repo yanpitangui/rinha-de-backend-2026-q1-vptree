@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-lb:e3a95e24ae2efca445b2805154ec1dc483cf8205
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-lb:262af75c44fdf14f16831a6a42a9e26572ba120e
     ports:
       - "9999:9999"
     volumes:
@@ -15,11 +15,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.15"
           memory: "10MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:e3a95e24ae2efca445b2805154ec1dc483cf8205
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:262af75c44fdf14f16831a6a42a9e26572ba120e
     hostname: api1
     security_opt:
       - seccomp:unconfined
@@ -39,11 +39,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.425"
           memory: "160MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:e3a95e24ae2efca445b2805154ec1dc483cf8205
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:262af75c44fdf14f16831a6a42a9e26572ba120e
     hostname: api2
     security_opt:
       - seccomp:unconfined
@@ -63,7 +63,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.425"
           memory: "160MB"
 
 volumes:
