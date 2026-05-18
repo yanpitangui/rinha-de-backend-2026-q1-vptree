@@ -130,6 +130,7 @@ public static class RawServer
         setsockopt(fd, IpprotoTcp, TcpNodelay, &one, 4);
 
         const int BufSize = 4096;
+        const int MsgWaitAll = 0x100;
         byte* buf = stackalloc byte[BufSize];
         int filled = 0;
 
@@ -137,15 +138,16 @@ public static class RawServer
         {
             while (true)
             {
-                // Fill buffer until full header block is present
-                int hdrEnd = FindHdrEnd(buf, filled);
+                // Vectorized scan; on keep-alive the pipelined request may already be in buf
+                int hdrEnd = FindHdrEnd(buf, 0, filled);
                 while (hdrEnd < 0)
                 {
                     if (filled >= BufSize) return;
+                    int scanFrom = filled > 3 ? filled - 3 : 0;
                     int n = recv(fd, buf + filled, (nuint)(BufSize - filled), 0);
                     if (n <= 0) return;
                     filled += n;
-                    hdrEnd = FindHdrEnd(buf, filled);
+                    hdrEnd = FindHdrEnd(buf, scanFrom, filled);
                 }
 
                 if (buf[0] == 'G') // GET /ready
@@ -155,15 +157,15 @@ public static class RawServer
                     continue;
                 }
 
-                // POST /fraud-score: find and read full body
                 int clen = ParseContentLength(buf, hdrEnd);
                 if (clen <= 0) { SendAll(fd, s_badResp); return; }
 
                 int bodyEnd = hdrEnd + clen;
-                while (filled < bodyEnd)
+                if (bodyEnd > BufSize) return;
+                if (filled < bodyEnd)
                 {
-                    if (bodyEnd > BufSize) return; // oversized body
-                    int n = recv(fd, buf + filled, (nuint)(bodyEnd - filled), 0);
+                    // MSG_WAITALL: single syscall blocks until full body arrives
+                    int n = recv(fd, buf + filled, (nuint)(bodyEnd - filled), MsgWaitAll);
                     if (n <= 0) return;
                     filled += n;
                 }
@@ -190,12 +192,10 @@ public static class RawServer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe int FindHdrEnd(byte* buf, int len)
+    private static unsafe int FindHdrEnd(byte* buf, int from, int len)
     {
-        for (int i = 0; i <= len - 4; i++)
-            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
-                return i + 4;
-        return -1;
+        int idx = new ReadOnlySpan<byte>(buf + from, len - from).IndexOf("\r\n\r\n"u8);
+        return idx >= 0 ? from + idx + 4 : -1;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

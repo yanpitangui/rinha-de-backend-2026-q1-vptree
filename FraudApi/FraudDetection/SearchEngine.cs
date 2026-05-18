@@ -164,16 +164,18 @@ public unsafe class SearchEngine
                 // Initialize acc with (query[0] - centroid[0][ci])^2 for all ci
                 float* base0 = cPtr;
                 var qv0 = Vector256.Create(queryF[0]);
+                Sse.Prefetch0(cPtr + _k); // prefetch dim 1 while processing dim 0
                 for (int ci = 0; ci < _k; ci += 8)
                 {
                     var dif = Avx.Subtract(qv0, Avx.LoadVector256(base0 + ci));
                     Avx.Store(acc + ci, Avx.Multiply(dif, dif));
                 }
 
-                // FMA-accumulate dims 1–13
+                // FMA-accumulate dims 1–13; prefetch next dim's start each iteration
                 for (int d = 1; d < 14; d++)
                 {
                     float* baseD = cPtr + d * _k;
+                    if (d + 1 < 14) Sse.Prefetch0(cPtr + (d + 1) * _k);
                     var qvd = Vector256.Create(queryF[d]);
                     for (int ci = 0; ci < _k; ci += 8)
                     {
