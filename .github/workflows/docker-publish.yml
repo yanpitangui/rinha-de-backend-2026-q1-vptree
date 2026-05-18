@@ -57,5 +57,4 @@ jobs:
           tags: |
             ${{ env.IMAGE_LB }}:latest
             ${{ env.IMAGE_LB }}:${{ github.sha }}
-          cache-from: type=gha,scope=lb
-          cache-to: type=gha,mode=max,scope=lb
+          no-cache: true
