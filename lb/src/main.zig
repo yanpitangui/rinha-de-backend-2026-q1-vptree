@@ -93,6 +93,8 @@ pub fn main() !void {
     var opt: i32 = 1;
     try checkErrno(linux.setsockopt(server_fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&opt), @sizeOf(i32)));
     try checkErrno(linux.setsockopt(server_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, @ptrCast(&opt), @sizeOf(i32)));
+    var defer_secs: i32 = 1;
+    _ = linux.setsockopt(server_fd, linux.IPPROTO.TCP, linux.TCP.DEFER_ACCEPT, @ptrCast(&defer_secs), @sizeOf(i32));
 
     const addr = linux.sockaddr.in{
         .port = std.mem.nativeToBig(u16, LISTEN_PORT),
@@ -115,7 +117,7 @@ pub fn main() !void {
     };
 
     // io_uring
-    var ring = try linux.IoUring.init(RING_ENTRIES, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER);
+    var ring = try linux.IoUring.init(RING_ENTRIES, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN);
     defer ring.deinit();
 
     // Multishot accept: one SQE produces CQEs indefinitely
