@@ -1,12 +1,10 @@
 services:
   lb:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-lb:dc1acfefa1c1567c339899e278abf93347c1659f
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-lb:ff6371a301ea4277fb7cc46b688788e437ec40e6
     ports:
       - "9999:9999"
     volumes:
       - uds-sockets:/sockets
-    security_opt:
-      - seccomp:unconfined
     depends_on:
       api1:
         condition: service_healthy
@@ -19,10 +17,8 @@ services:
           memory: "10MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:dc1acfefa1c1567c339899e278abf93347c1659f
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:ff6371a301ea4277fb7cc46b688788e437ec40e6
     hostname: api1
-    security_opt:
-      - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-16}
@@ -43,10 +39,8 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:dc1acfefa1c1567c339899e278abf93347c1659f
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1:ff6371a301ea4277fb7cc46b688788e437ec40e6
     hostname: api2
-    security_opt:
-      - seccomp:unconfined
     environment:
       - NPROBE=${NPROBE:-2}
       - NPROBE_RETRY=${NPROBE_RETRY:-16}
