@@ -85,7 +85,7 @@ public static class DirectHandler
     {
         var reader = new Utf8JsonReader(body);
 
-        double amount = 0, avgAmount = 1, merchantAvgAmount = 0, kmFromHome = 0, kmFromCurrent = 0;
+        float amount = 0, avgAmount = 1, merchantAvgAmount = 0, kmFromHome = 0, kmFromCurrent = 0;
         int installments = 0, txCount24h = 0, mcc = 0;
         bool isOnline = false, cardPresent = false, hasLastTx = false;
 
@@ -183,21 +183,21 @@ public static class DirectHandler
                         switch (section)
                         {
                             case 1:
-                                if (field == 1) amount = reader.GetDouble();
+                                if (field == 1) amount = reader.GetSingle();
                                 else if (field == 2) installments = reader.GetInt32();
                                 break;
                             case 2:
-                                if (field == 1) avgAmount = reader.GetDouble();
+                                if (field == 1) avgAmount = reader.GetSingle();
                                 else if (field == 2) txCount24h = reader.GetInt32();
                                 break;
                             case 4:
-                                if (field == 3) merchantAvgAmount = reader.GetDouble();
+                                if (field == 3) merchantAvgAmount = reader.GetSingle();
                                 break;
                             case 5:
-                                if (field == 3) kmFromHome = reader.GetDouble();
+                                if (field == 3) kmFromHome = reader.GetSingle();
                                 break;
                             case 6:
-                                if (field == 2) kmFromCurrent = reader.GetDouble();
+                                if (field == 2) kmFromCurrent = reader.GetSingle();
                                 break;
                         }
                         break;
@@ -258,9 +258,9 @@ public static class DirectHandler
 
         const int Scale = Vectorizer.Scale;
 
-        dst[0] = Q(Clamp(amount / n.MaxAmount));
-        dst[1] = Q(Clamp(installments / n.MaxInstallments));
-        dst[2] = Q(Clamp(amount / avgAmount / n.AmountVsAvgRatio));
+        dst[0] = Q(Clamp(amount / (float)n.MaxAmount));
+        dst[1] = Q(Clamp(installments / (float)n.MaxInstallments));
+        dst[2] = Q(Clamp(amount / avgAmount / (float)n.AmountVsAvgRatio));
 
         var (hour, dow) = ParseUtcHourDow(reqAt);
         dst[3] = Vectorizer.HourLut[hour];
@@ -273,12 +273,12 @@ public static class DirectHandler
         }
         else
         {
-            dst[5] = Q(Clamp(MinutesDiff(lastAt, reqAt) / n.MaxMinutes));
-            dst[6] = Q(Clamp(kmFromCurrent / n.MaxKm));
+            dst[5] = Q(Clamp(MinutesDiff(lastAt, reqAt) / (float)n.MaxMinutes));
+            dst[6] = Q(Clamp(kmFromCurrent / (float)n.MaxKm));
         }
 
-        dst[7]  = Q(Clamp(kmFromHome / n.MaxKm));
-        dst[8]  = Q(Clamp(txCount24h / n.MaxTxCount24h));
+        dst[7]  = Q(Clamp(kmFromHome / (float)n.MaxKm));
+        dst[8]  = Q(Clamp(txCount24h / (float)n.MaxTxCount24h));
         dst[9]  = isOnline ? (short)Scale : (short)0;
         dst[10] = cardPresent ? (short)Scale : (short)0;
 
@@ -294,7 +294,7 @@ public static class DirectHandler
         }
         dst[11] = knownMerchant ? (short)0 : (short)Scale;
         dst[12] = FraudHandler.MccLut[mcc];
-        dst[13] = Q(Clamp(merchantAvgAmount / n.MaxMerchantAvgAmount));
+        dst[13] = Q(Clamp(merchantAvgAmount / (float)n.MaxMerchantAvgAmount));
         dst[14] = 0;
         dst[15] = 0;
 
@@ -333,14 +333,12 @@ public static class DirectHandler
              + s_doy[m - 1] + (leap && m > 2 ? 1 : 0) + d - 1;
     }
 
-    // Returns elapsed minutes between two "YYYY-MM-DDTHH:MM:SSZ" timestamps (from - to).
-    // Uses DateTime only for the day-of-year component; avoids the full DateTime subtraction allocation.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double MinutesDiff(ReadOnlySpan<byte> from, ReadOnlySpan<byte> to)
+    private static float MinutesDiff(ReadOnlySpan<byte> from, ReadOnlySpan<byte> to)
     {
         var dtFrom = ParseUtcTicks(from);
         var dtTo   = ParseUtcTicks(to);
-        return (dtTo - dtFrom) / (double)TimeSpan.TicksPerMinute;
+        return (float)((dtTo - dtFrom) / (double)TimeSpan.TicksPerMinute);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -357,12 +355,12 @@ public static class DirectHandler
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static short Q(double v)
+    internal static short Q(float v)
     {
-        var q = (int)Math.Round(v * Vectorizer.Scale);
+        var q = (int)MathF.Round(v * Vectorizer.Scale);
         return q > short.MaxValue ? short.MaxValue : q < short.MinValue ? short.MinValue : (short)q;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double Clamp(double x) => x < 0.0 ? 0.0 : x > 1.0 ? 1.0 : x;
+    private static float Clamp(float x) => x < 0f ? 0f : x > 1f ? 1f : x;
 }

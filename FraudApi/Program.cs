@@ -36,10 +36,10 @@ FraudHandler.Norm      = normalization;
 FraudHandler.Responses = BuildResponses();
 
 var mccLut = new short[10000];
-Array.Fill(mccLut, DirectHandler.Q(0.5));
+Array.Fill(mccLut, DirectHandler.Q(0.5f));
 foreach (var kv in mccRisk)
     if ((uint)kv.Key < 10000u)
-        mccLut[kv.Key] = DirectHandler.Q(kv.Value);
+        mccLut[kv.Key] = DirectHandler.Q((float)kv.Value);
 FraudHandler.MccLut = mccLut;
 
 var fastPathFile = Path.Combine(resourcesPath, "fastpath.bin");
