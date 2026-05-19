@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree-lb:640918ba3546d2bc016fc4b19296873ae0f6a81c
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree-lb:273f61d9143e2d69de0e4c39494109af083b0595
     ports:
       - "9999:9999"
     volumes:
@@ -17,11 +17,11 @@ services:
           memory: "10MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:640918ba3546d2bc016fc4b19296873ae0f6a81c
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:273f61d9143e2d69de0e4c39494109af083b0595
     hostname: api1
     cpuset: "0,1"
     environment:
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-150}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
       - DOTNET_PROCESSOR_COUNT=1
       - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
     volumes:
@@ -39,11 +39,11 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:640918ba3546d2bc016fc4b19296873ae0f6a81c
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:273f61d9143e2d69de0e4c39494109af083b0595
     hostname: api2
     cpuset: "2,3"
     environment:
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-150}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
       - DOTNET_PROCESSOR_COUNT=1
       - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
     volumes:
