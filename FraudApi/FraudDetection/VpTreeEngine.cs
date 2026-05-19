@@ -54,8 +54,8 @@ public sealed unsafe class VpTreeEngine
         fixed (float* qfp = qf)
         {
             // Explicit stack — avoids ~23 recursive call frames per query.
-            // Each entry: (nodeIdx, minDist). Skip entry if minDist > heap.Worst.
-            // Far side pushed first (with gap as minDist), near side second (minDist=0),
+            // Each entry: (nodeIdx, minDistSq). Skip entry if minDistSq > heap.Worst (sq).
+            // Far side pushed first (with gap² as minDistSq), near side second (0),
             // so near side is processed first (LIFO). Lazy pruning on pop.
             StackEntry* stack = stackalloc StackEntry[64];
             int top = 0;
@@ -64,7 +64,7 @@ public sealed unsafe class VpTreeEngine
             while (top > 0)
             {
                 StackEntry e = stack[--top];
-                if (e.MinDist > heap.Worst) continue;
+                if (e.MinDistSq > heap.Worst) continue;
 
                 VpNode* node = _nodes + e.NodeIdx;
 
@@ -85,7 +85,7 @@ public sealed unsafe class VpTreeEngine
 
                 Sse.Prefetch0(_nodes + near);
 
-                stack[top++] = new StackEntry(far,  gap);
+                stack[top++] = new StackEntry(far,  gap * gap);
                 stack[top++] = new StackEntry(near, 0f);
             }
         }
@@ -96,14 +96,11 @@ public sealed unsafe class VpTreeEngine
     private void ScanLeafBlocks(float* qf, int blockStart, int blockCount, ref KnnHeap5 heap)
     {
         float* dptr    = stackalloc float[8];
-        float  boundSq = heap.Worst < float.MaxValue ? heap.Worst * heap.Worst : float.MaxValue;
+        float  boundSq = heap.Worst; // heap.Worst is already dist²
 
         for (int bi = 0; bi < blockCount; bi++)
         {
             Block* block = _leafBlocks + blockStart + bi;
-            if (Sse.IsSupported && bi + 4 < blockCount)
-                Sse.Prefetch0(_leafBlocks + blockStart + bi + 4);
-
             if (!ProcessBlock(block, qf, dptr, boundSq)) continue;
 
             byte* labels = _leafLabels + ((long)(blockStart + bi) << 3);
@@ -111,10 +108,8 @@ public sealed unsafe class VpTreeEngine
             {
                 float dsq = dptr[i];
                 if (dsq >= boundSq) continue;
-                float d = MathF.Sqrt(dsq);
-                heap.TryAdd(d, labels[i]);
-                if (heap.Worst < float.MaxValue)
-                    boundSq = heap.Worst * heap.Worst;
+                heap.TryAddSq(dsq, labels[i]);
+                boundSq = heap.Worst;
             }
         }
     }
@@ -177,22 +172,29 @@ public sealed unsafe class VpTreeEngine
 
 public unsafe struct KnnHeap5
 {
-    private fixed float _d[5];
+    private fixed float _d[5]; // squared distances
     private fixed byte  _l[5];
     private int _count;
 
+    // Returns max dist² in heap (float.MaxValue when not full).
+    // Used directly as boundSq — no multiply needed.
     public float Worst => _count < 5 ? float.MaxValue : _d[0];
 
-    public void TryAdd(float d, byte lbl)
+    // For VP node adds: squares d internally so callers keep linear-dist semantics.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void TryAdd(float d, byte lbl) => TryAddSq(d * d, lbl);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void TryAddSq(float dsq, byte lbl)
     {
         if (_count < 5)
         {
-            _d[_count] = d; _l[_count] = lbl;
+            _d[_count] = dsq; _l[_count] = lbl;
             if (++_count == 5) BuildHeap();
             return;
         }
-        if (d >= _d[0]) return;
-        _d[0] = d; _l[0] = lbl;
+        if (dsq >= _d[0]) return;
+        _d[0] = dsq; _l[0] = lbl;
         SiftDown(0);
     }
 
@@ -218,6 +220,6 @@ public unsafe struct KnnHeap5
 internal readonly struct StackEntry
 {
     public readonly int   NodeIdx;
-    public readonly float MinDist;
-    public StackEntry(int nodeIdx, float minDist) { NodeIdx = nodeIdx; MinDist = minDist; }
+    public readonly float MinDistSq;
+    public StackEntry(int nodeIdx, float minDistSq) { NodeIdx = nodeIdx; MinDistSq = minDistSq; }
 }
