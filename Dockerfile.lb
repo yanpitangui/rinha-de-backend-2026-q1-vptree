@@ -3,7 +3,7 @@ RUN apk add --no-cache zig
 
 WORKDIR /app
 COPY . .
-RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
+RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=haswell
 
 FROM scratch
 COPY --from=builder /app/zig-out/bin/lb /lb
