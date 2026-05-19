@@ -6,13 +6,20 @@ using FraudApi.Shared;
 
 namespace FraudApi.FraudDetection;
 
-[StructLayout(LayoutKind.Sequential, Size = 16)]
-public struct VpNode
+// 64 bytes = exactly 1 cache line.
+// Internal nodes: Vp[] + VpLabel + Threshold + Left + Right all in one fetch.
+// Leaf nodes: Right=-1, Left=blockStart, VpIdxOrCount=blockCount; Vp[]/VpLabel/Threshold unused.
+[StructLayout(LayoutKind.Sequential, Pack = 2, Size = 64)]
+public unsafe struct VpNode
 {
-    public int   VpIdxOrCount; // internal: index into vpVecs array; leaf: block count
-    public float Threshold;    // internal: partition distance mu (normalized linear)
-    public int   Left;         // internal: left child node idx; leaf: blockStart
-    public int   Right;        // internal: right child node idx; leaf: -1
+    public int   Left;          // internal: left child idx;  leaf: blockStart
+    public int   Right;         // internal: right child idx; leaf: -1
+    public float Threshold;     // internal: mu (normalized linear dist)
+    public byte  VpLabel;       // internal: fraud label of vantage point
+    public byte  BlockCountHi;  // leaf: high byte of blockCount (low byte in Left.high16 — unused; just use VpIdxOrCount)
+    public int   VpIdxOrCount;  // leaf: blockCount (reuse field)
+    public fixed short Vp[14];  // internal: VP vector (variance-ordered, int16)
+    // Total used: 4+4+4+1+1+4+28 = 46 bytes → padded to 64 by Size=64
 }
 
 public sealed unsafe class VpTreeEngine
@@ -20,20 +27,13 @@ public sealed unsafe class VpTreeEngine
     private const float InvScale = 1.0f / Vectorizer.Scale;
 
     private readonly VpNode* _nodes;
-    private readonly short*  _vpVecs;     // internalCount × 14, row-major, variance-ordered
-    private readonly byte*   _vpLabels;   // internalCount bytes
-    private readonly Block*  _leafBlocks; // leafBlockCount × Block (column-major 8-wide)
-    private readonly byte*   _leafLabels; // leafBlockCount × 8 bytes
+    private readonly Block*  _leafBlocks;  // leafBlockCount × Block (column-major 8-wide)
+    private readonly byte*   _leafLabels;  // leafBlockCount × 8 bytes
     private readonly int[]   _dimOrder;
 
-    public VpTreeEngine(
-        VpNode* nodes, short* vpVecs, byte* vpLabels,
-        Block* leafBlocks, byte* leafLabels,
-        int[] dimOrder)
+    public VpTreeEngine(VpNode* nodes, Block* leafBlocks, byte* leafLabels, int[] dimOrder)
     {
         _nodes      = nodes;
-        _vpVecs     = vpVecs;
-        _vpLabels   = vpLabels;
         _leafBlocks = leafBlocks;
         _leafLabels = leafLabels;
         _dimOrder   = dimOrder;
@@ -42,11 +42,9 @@ public sealed unsafe class VpTreeEngine
     [SkipLocalsInit]
     public int Search(Span<short> query)
     {
-        // Reorder query dims by variance (high→low) — matches stored vector dim order
         Span<short> q = stackalloc short[16];
         for (int di = 0; di < 14; di++) q[di] = query[_dimOrder[di]];
 
-        // Pre-compute float query for AVX2 leaf scan
         Span<float> qf = stackalloc float[16];
         for (int di = 0; di < 14; di++) qf[di] = q[di] * InvScale;
 
@@ -67,10 +65,9 @@ public sealed unsafe class VpTreeEngine
             return;
         }
 
-        // Internal node: compute dist to vantage point (scalar, linear)
-        int    vpIdx  = node->VpIdxOrCount;
-        float  vpDist = DistNorm(q, _vpVecs + (long)vpIdx * 14);
-        heap.TryAdd(vpDist, _vpLabels[vpIdx]);
+        // All VP data is inline in the node — single cache line fetch covers everything
+        float vpDist = DistNorm(q, node->Vp);
+        heap.TryAdd(vpDist, node->VpLabel);
 
         float mu  = node->Threshold;
         float tau = heap.Worst;
@@ -91,7 +88,6 @@ public sealed unsafe class VpTreeEngine
         }
     }
 
-    // AVX2 leaf scan: process 8 vectors per block, early-exit via bound check
     [SkipLocalsInit]
     private void ScanLeafBlocks(float* qf, int blockStart, int blockCount, ref KnnHeap5 heap)
     {
@@ -119,8 +115,6 @@ public sealed unsafe class VpTreeEngine
         }
     }
 
-    // Compute squared distance (normalized float) for all 8 lanes in a column-major Block.
-    // Returns false if ALL 8 lanes exceed boundSq at a partial-dim checkpoint → skip block.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     [SkipLocalsInit]
     private static bool ProcessBlock(Block* block, float* qf, float* dptr, float boundSq)
@@ -164,7 +158,6 @@ public sealed unsafe class VpTreeEngine
         return true;
     }
 
-    // Scalar linear distance for VP node lookups (called ~log(N) times per query)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float DistNorm(short* q, short* v)
     {

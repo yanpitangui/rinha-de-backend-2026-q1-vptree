@@ -6,7 +6,8 @@ using FraudApi.Shared;
 const int   Scale           = 10000;
 const int   Dims            = 14;
 const int   BucketSize      = 64;
-const int   Magic           = 0x56505453; // "VPTS"
+const int   VpSampleSize    = 20;         // candidates sampled per node for vantage point selection
+const int   Magic           = 0x56505454; // "VPTT"
 const short PaddingSentinel = Scale;      // > any valid value → large distance → never enters heap
 
 var resourcesPath =
@@ -107,12 +108,9 @@ Console.WriteLine("Building VP-tree...");
 
 var rng          = new Random(42);
 var nodes        = new List<VpNode>();
-var vpVecsList   = new List<short>();   // internalCount × 14 shorts
-var vpLabelsList = new List<byte>();    // internalCount bytes
-int internalCount  = 0;
 int leafBlockCount = 0;
 
-// Leaf data buffered to streams — written after nodes/vpVecs in the final file
+// Leaf data buffered to streams — written after nodes in the final file
 var leafBlocksMs = new MemoryStream();
 var leafLabelsMs = new MemoryStream();
 var bwLB = new BinaryWriter(leafBlocksMs);
@@ -125,16 +123,14 @@ BuildNode(allIndices);
 bwLB.Flush(); bwLL.Flush();
 
 int nodeCount = nodes.Count;
-Console.WriteLine($"VP-tree built: {nodeCount} nodes ({internalCount} internal, {nodeCount - internalCount} leaves), {leafBlockCount} leaf blocks");
+Console.WriteLine($"VP-tree built: {nodeCount} nodes, {leafBlockCount} leaf blocks");
 
 // ── Phase 4: write vptree.bin ─────────────────────────────────────────────
 // Layout:
-//   [4B] magic  [4B] N  [4B] nodeCount  [4B] bucketSize  [4B] internalCount  [4B] leafBlockCount
+//   [4B] magic  [4B] N  [4B] nodeCount  [4B] bucketSize  [4B] leafBlockCount
 //   [14×4B] dimOrder
-//   nodes:      nodeCount × 16B
-//   vpVecs:     internalCount × 14 × 2B  (row-major, variance-ordered)
-//   vpLabels:   internalCount × 1B
-//   leafBlocks: leafBlockCount × sizeof(Block)  (= ×224B, column-major 8-wide)
+//   nodes:      nodeCount × 64B (VpNode with inline VP vector)
+//   leafBlocks: leafBlockCount × sizeof(Block) (= ×224B, column-major 8-wide)
 //   leafLabels: leafBlockCount × 8B
 
 using var bw = new BinaryWriter(File.Create(output));
@@ -142,20 +138,32 @@ bw.Write(Magic);
 bw.Write(total);
 bw.Write(nodeCount);
 bw.Write(BucketSize);
-bw.Write(internalCount);
 bw.Write(leafBlockCount);
 foreach (var d in dimOrder) bw.Write(d);
 
 foreach (var nd in nodes)
 {
-    bw.Write(nd.VpIdxOrCount);
-    bw.Write(nd.Threshold);
+    // Binary layout must match runtime VpNode [StructLayout(Sequential, Pack=2, Size=64)]:
+    //   int Left      @ 0  (4B)
+    //   int Right     @ 4  (4B)
+    //   float Thresh  @ 8  (4B)
+    //   byte VpLabel  @ 12 (1B)
+    //   byte Hi       @ 13 (1B)
+    //   int VpOrCnt   @ 14 (4B)  [Pack=2 → no gap after byte]
+    //   short Vp[14]  @ 18 (28B)
+    //   padding       @ 46 (18B) → total 64B
     bw.Write(nd.Left);
     bw.Write(nd.Right);
+    bw.Write(nd.Threshold);
+    bw.Write(nd.VpLabel);
+    bw.Write((byte)0);          // BlockCountHi (unused)
+    bw.Write(nd.VpIdxOrCount);
+    if (nd.Vp != null)
+        foreach (var v in nd.Vp) bw.Write(v);
+    else
+        for (int i = 0; i < Dims; i++) bw.Write((short)0);
+    for (int i = 0; i < 18; i++) bw.Write((byte)0); // pad to 64B
 }
-
-foreach (var v in vpVecsList)   bw.Write(v);
-foreach (var v in vpLabelsList) bw.Write(v);
 
 var leafBlocksBytes = leafBlocksMs.ToArray();
 var leafLabelsBytes = leafLabelsMs.ToArray();
@@ -208,13 +216,7 @@ int BuildNode(int[] indices)
     }
 
     // Internal node
-    int myVpIdx    = internalCount++;
     int vpGlobalIdx = PickVantagePoint(indices);
-
-    // Store VP vector (variance-ordered) and label
-    for (int di = 0; di < Dims; di++)
-        vpVecsList.Add(allVecs[vpGlobalIdx * 16 + dimOrder[di]]);
-    vpLabelsList.Add(allLabels[vpGlobalIdx]);
 
     // Partition non-VP points by distance to VP
     int nonVpCount = indices.Length - 1;
@@ -264,13 +266,22 @@ int BuildNode(int[] indices)
     int leftChild  = BuildNode(leftArr);
     int rightChild = BuildNode(rightArr);
 
-    nodes[nodeIdx] = new VpNode { VpIdxOrCount = myVpIdx, Threshold = mu, Left = leftChild, Right = rightChild };
+    var vp = new short[Dims];
+    for (int di = 0; di < Dims; di++)
+        vp[di] = allVecs[vpGlobalIdx * 16 + dimOrder[di]];
+
+    nodes[nodeIdx] = new VpNode
+    {
+        Left = leftChild, Right = rightChild,
+        Threshold = mu, VpLabel = allLabels[vpGlobalIdx],
+        VpIdxOrCount = 0, Vp = vp
+    };
     return nodeIdx;
 }
 
 int PickVantagePoint(int[] indices)
 {
-    int sampleSize = Math.Min(5, indices.Length);
+    int sampleSize = Math.Min(VpSampleSize, indices.Length);
     var sample     = new int[sampleSize];
     for (int i = 0; i < sampleSize; i++) sample[i] = indices[i];
     for (int i = sampleSize; i < indices.Length; i++)
@@ -394,11 +405,13 @@ static int FindBinS(short[] edges, short v)
     return edges.Length;
 }
 
-[StructLayout(LayoutKind.Sequential, Size = 16)]
+[StructLayout(LayoutKind.Sequential)]
 struct VpNode
 {
-    public int   VpIdxOrCount; // internal: index into vpVecs; leaf: block count
-    public float Threshold;    // internal: mu (normalized linear dist)
-    public int   Left;         // internal: left child node idx; leaf: blockStart
-    public int   Right;        // internal: right child node idx; leaf: -1
+    public int    Left;
+    public int    Right;
+    public float  Threshold;
+    public byte   VpLabel;
+    public int    VpIdxOrCount; // leaf: block count; internal: 0
+    public short[]? Vp;         // internal: 14 shorts (variance-ordered); null for leaves
 }
