@@ -52,41 +52,42 @@ public sealed unsafe class VpTreeEngine
         var heap = new KnnHeap5();
         fixed (short* qp = q)
         fixed (float* qfp = qf)
-            SearchNode(0, qp, qfp, ref heap);
+        {
+            // Explicit stack — avoids ~23 recursive call frames per query.
+            // Each entry: (nodeIdx, minDist). Skip entry if minDist > heap.Worst.
+            // Far side pushed first (with gap as minDist), near side second (minDist=0),
+            // so near side is processed first (LIFO). Lazy pruning on pop.
+            StackEntry* stack = stackalloc StackEntry[64];
+            int top = 0;
+            stack[top++] = new StackEntry(0, 0f);
+
+            while (top > 0)
+            {
+                StackEntry e = stack[--top];
+                if (e.MinDist > heap.Worst) continue;
+
+                VpNode* node = _nodes + e.NodeIdx;
+
+                if (node->Right == -1)
+                {
+                    ScanLeafBlocks(qfp, node->Left, node->VpIdxOrCount, ref heap);
+                    continue;
+                }
+
+                float vpDist = DistNorm(qp, node->Vp);
+                heap.TryAdd(vpDist, node->VpLabel);
+
+                float mu = node->Threshold;
+                int near, far;
+                float gap;
+                if (vpDist <= mu) { near = node->Left;  far = node->Right; gap = mu - vpDist; }
+                else              { near = node->Right; far = node->Left;  gap = vpDist - mu; }
+
+                stack[top++] = new StackEntry(far,  gap);
+                stack[top++] = new StackEntry(near, 0f);
+            }
+        }
         return heap.FraudCount;
-    }
-
-    private void SearchNode(int nodeIdx, short* q, float* qf, ref KnnHeap5 heap)
-    {
-        VpNode* node = _nodes + nodeIdx;
-
-        if (node->Right == -1)
-        {
-            ScanLeafBlocks(qf, node->Left, node->VpIdxOrCount, ref heap);
-            return;
-        }
-
-        // All VP data is inline in the node — single cache line fetch covers everything
-        float vpDist = DistNorm(q, node->Vp);
-        heap.TryAdd(vpDist, node->VpLabel);
-
-        float mu  = node->Threshold;
-        float tau = heap.Worst;
-
-        if (vpDist <= mu)
-        {
-            SearchNode(node->Left, q, qf, ref heap);
-            tau = heap.Worst;
-            if (mu - vpDist <= tau)
-                SearchNode(node->Right, q, qf, ref heap);
-        }
-        else
-        {
-            SearchNode(node->Right, q, qf, ref heap);
-            tau = heap.Worst;
-            if (vpDist - mu <= tau)
-                SearchNode(node->Left, q, qf, ref heap);
-        }
     }
 
     [SkipLocalsInit]
@@ -210,4 +211,11 @@ public unsafe struct KnnHeap5
     }
 
     public int FraudCount { get { int c = 0; for (int i = 0; i < 5; i++) c += _l[i]; return c; } }
+}
+
+internal readonly struct StackEntry
+{
+    public readonly int   NodeIdx;
+    public readonly float MinDist;
+    public StackEntry(int nodeIdx, float minDist) { NodeIdx = nodeIdx; MinDist = minDist; }
 }
