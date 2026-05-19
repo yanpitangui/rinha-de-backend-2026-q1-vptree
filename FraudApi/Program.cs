@@ -11,6 +11,7 @@ GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
 var minWorkers = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_WORKERS"), out var minW) ? minW : 8;
 var minIoThreads = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_IO"), out var minIo) ? minIo : 64;
 ThreadPool.SetMinThreads(minWorkers, minIoThreads);
+ThreadPool.SetMaxThreads(minWorkers, minIoThreads);
 
 var resourcesPath = Environment.GetEnvironmentVariable("RESOURCES_PATH")
     ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../resources"));

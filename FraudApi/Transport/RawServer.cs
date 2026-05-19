@@ -124,7 +124,7 @@ public static class RawServer
             int clientFd = *(int*)(cmsgBuf + sizeof(CmsgHdr));
             if (clientFd < 0) continue;
 
-            ThreadPool.UnsafeQueueUserWorkItem(HandleClient, clientFd, preferLocal: true);
+            ThreadPool.UnsafeQueueUserWorkItem(HandleClient, clientFd, preferLocal: false);
         }
     }
 
