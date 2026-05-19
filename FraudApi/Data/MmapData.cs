@@ -1,26 +1,39 @@
 using System.Runtime.InteropServices;
-using FraudApi.Shared;
+using FraudApi.FraudDetection;
 
 namespace FraudApi.Data;
 
+// vptree.bin layout:
+//   [4B] magic 0x56505452
+//   [4B] total (N)
+//   [4B] nodeCount
+//   [4B] bucketSize (ignored at runtime)
+//   [4B] leafIdxCount
+//   [14×4B] dimOrder
+//   [nodeCount×16B] VpNode[]
+//   [leafIdxCount×4B] leafIndices
+//   [N×14×2B] vecs (row-major, variance-ordered dims)
+//   [N×1B] labels
 public sealed unsafe class MmapData
 {
     [DllImport("libc")] private static extern int madvise(void* addr, nuint length, int advice);
     private const int MadvHugePage = 14;
+    private const int Magic = 0x56505452; // "VPTR"
 
-    public Block* Blocks;
-    public byte* Labels;
-    public short* BboxMin; // K * 14 shorts
-    public short* BboxMax; // K * 14 shorts
-    public int BlockCount;
-    public int Total;
-    public int K;
-    public float[] Centroids = null!;
-    public int[] ClusterBlockStart = null!;
-    public int[] ClusterBlockLen = null!;
-    public int[] DimOrder = null!; // 14 dim indices sorted by variance descending
+    public VpNode* Nodes;
+    public int*    LeafIndices;
+    public short*  Vecs;
+    public byte*   Labels;
+    public int     NodeCount;
+    public int     Total;
+    public int[]   DimOrder = null!;
 
-    private byte[] _data = null!;
+#pragma warning disable CS0414
+    private byte[] _data = null!; // pinned; GC must not collect while pointers are live
+#pragma warning restore CS0414
+
+    public VpTreeEngine CreateEngine() =>
+        new(Nodes, LeafIndices, Vecs, Labels, DimOrder);
 
     public static MmapData Load(string path)
     {
@@ -29,61 +42,44 @@ public sealed unsafe class MmapData
         using var fs = File.OpenRead(path);
         fs.ReadExactly(data);
 
-        // Hugepages: collapse 4KB→2MB pages, reduce TLB pressure on 90MB dataset
         fixed (byte* p = data)
         {
             madvise(p, (nuint)fileSize, MadvHugePage);
-            // Prefault: touch every 4KB boundary to avoid page faults during serving
             for (long i = 0; i < fileSize; i += 4096)
                 _ = p[i];
         }
 
         fixed (byte* ptr = &MemoryMarshal.GetArrayDataReference(data))
         {
-            int blockCount = *(int*)(ptr + 4);
-            int total      = *(int*)(ptr + 8);
-            int k          = *(int*)(ptr + 12);
+            int magic = *(int*)(ptr + 0);
+            if (magic != Magic)
+                throw new InvalidDataException($"vptree.bin: expected 0x{Magic:X8}, got 0x{magic:X8}");
 
-            // dimOrder: 14 ints at offset 16
-            int* dimOrderPtr = (int*)(ptr + 16);
+            int total        = *(int*)(ptr + 4);
+            int nodeCount    = *(int*)(ptr + 8);
+            // bucketSize     = *(int*)(ptr + 12) — not needed at runtime
+            int leafIdxCount = *(int*)(ptr + 16);
+
+            int* dimOrderPtr = (int*)(ptr + 20);
             var dimOrder = new int[14];
             new ReadOnlySpan<int>(dimOrderPtr, 14).CopyTo(dimOrder);
 
-            // centroids column-major [dim][centroid]: after dimOrder (offset 16 + 14*4 = 72)
-            float* centroidPtr = (float*)(ptr + 72);
-            int centroidFloats = 14 * k;
-            var centroids = new float[centroidFloats];
-            new ReadOnlySpan<float>(centroidPtr, centroidFloats).CopyTo(centroids);
-
-            int* blockStartPtr = (int*)(centroidPtr + centroidFloats);
-            var clusterBlockStart = new int[k];
-            new ReadOnlySpan<int>(blockStartPtr, k).CopyTo(clusterBlockStart);
-
-            int* blockLenPtr = blockStartPtr + k;
-            var clusterBlockLen = new int[k];
-            new ReadOnlySpan<int>(blockLenPtr, k).CopyTo(clusterBlockLen);
-
-            short* bboxMinPtr = (short*)(blockLenPtr + k);
-            short* bboxMaxPtr = bboxMinPtr + k * 14;
-
-            byte* dataStart = (byte*)(bboxMaxPtr + k * 14);
-            var blocks = (Block*)dataStart;
-            var labels = dataStart + (long)sizeof(Block) * blockCount;
+            // offset 20 + 14*4 = 76
+            var nodes   = (VpNode*)(ptr + 76);
+            var leafIdx = (int*)   (ptr + 76 + (long)nodeCount * sizeof(VpNode));
+            var vecs    = (short*) ((byte*)leafIdx + (long)leafIdxCount * sizeof(int));
+            var labels  = (byte*)  (vecs + (long)total * 14);
 
             return new MmapData
             {
-                Blocks = blocks,
-                Labels = labels,
-                BboxMin = bboxMinPtr,
-                BboxMax = bboxMaxPtr,
-                BlockCount = blockCount,
-                Total = total,
-                K = k,
-                Centroids = centroids,
-                ClusterBlockStart = clusterBlockStart,
-                ClusterBlockLen = clusterBlockLen,
-                DimOrder = dimOrder,
-                _data = data
+                Nodes        = nodes,
+                LeafIndices  = leafIdx,
+                Vecs         = vecs,
+                Labels       = labels,
+                NodeCount    = nodeCount,
+                Total        = total,
+                DimOrder     = dimOrder,
+                _data        = data
             };
         }
     }

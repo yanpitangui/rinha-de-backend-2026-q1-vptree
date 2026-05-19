@@ -24,10 +24,7 @@ services:
       dockerfile: Dockerfile
     hostname: api1
     environment:
-      - NPROBE=${NPROBE:-2}
-      - NPROBE_RETRY=${NPROBE_RETRY:-16}
-      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-32}
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-150}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -48,10 +45,7 @@ services:
       dockerfile: Dockerfile
     hostname: api2
     environment:
-      - NPROBE=${NPROBE:-2}
-      - NPROBE_RETRY=${NPROBE_RETRY:-16}
-      - NPROBE_EXHAUST=${NPROBE_EXHAUST:-32}
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-150}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
     volumes:
       - uds-sockets:/sockets
     healthcheck:

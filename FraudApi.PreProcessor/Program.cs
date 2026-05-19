@@ -1,15 +1,11 @@
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Text.Json;
-using FraudApi.Shared;
 
-const int Scale = 10000;
-const int BlockSize = 8;
-const int Dims = 14;
-const int K = 1280;
-const int KMeansIter = 25;
-const int SampleSize = 262144;
-const short PaddingSentinel = Scale; // > any valid value, keeps padded slots far from queries
-const int Magic = unchecked((int)0x32465649); // "IVF2"
+const int Scale      = 10000;
+const int Dims       = 14;
+const int BucketSize = 16;
+const int Magic      = 0x56505452; // "VPTR"
 
 var resourcesPath =
     args.Length > 0
@@ -17,8 +13,8 @@ var resourcesPath =
         : Environment.GetEnvironmentVariable("RESOURCES_PATH")
         ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../resources"));
 
-var input = Path.Combine(resourcesPath, "references.json.gz");
-var output = Path.Combine(resourcesPath, "dataset.bin");
+var input  = Path.Combine(resourcesPath, "references.json.gz");
+var output = Path.Combine(resourcesPath, "vptree.bin");
 
 Console.WriteLine($"Loading dataset from: {input}");
 
@@ -32,15 +28,14 @@ int total = 0;
     using var fs  = File.OpenRead(input);
     using var gz  = new GZipStream(fs, CompressionMode.Decompress);
 
-    byte[] buffer = new byte[64 * 1024];
-    int bytesInBuffer = 0;
-    var state = new JsonReaderState();
+    byte[] buffer      = new byte[64 * 1024];
+    int bytesInBuffer  = 0;
+    var state          = new JsonReaderState();
 
     double[] vec = new double[Dims];
     bool inVector = false;
     int vi = 0;
-    bool isFraud = false;
-    bool vecComplete = false;
+    bool isFraud = false, vecComplete = false;
 
     void ProcessToken(ref Utf8JsonReader r)
     {
@@ -55,8 +50,7 @@ int total = 0;
                 vec[vi++] = r.GetDouble();
                 break;
             case JsonTokenType.EndArray when inVector:
-                inVector = false;
-                vecComplete = true;
+                inVector = false; vecComplete = true;
                 break;
             case JsonTokenType.EndObject when vecComplete:
                 int @base = total * 16;
@@ -64,8 +58,7 @@ int total = 0;
                     allVecs[@base + d] = Quantize(vec[d]);
                 allLabels[total] = isFraud ? (byte)1 : (byte)0;
                 total++;
-                vecComplete = false;
-                isFraud = false;
+                vecComplete = false; isFraud = false;
                 break;
         }
     }
@@ -75,24 +68,20 @@ int total = 0;
         int bytesRead = gz.Read(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
         if (bytesRead == 0) break;
         bytesInBuffer += bytesRead;
-
         var reader = new Utf8JsonReader(new ReadOnlySpan<byte>(buffer, 0, bytesInBuffer), false, state);
         while (reader.Read()) ProcessToken(ref reader);
-
         int consumed = (int)reader.BytesConsumed;
         Buffer.BlockCopy(buffer, consumed, buffer, 0, bytesInBuffer - consumed);
         bytesInBuffer -= consumed;
         state = reader.CurrentState;
     }
-
     var finalReader = new Utf8JsonReader(new ReadOnlySpan<byte>(buffer, 0, bytesInBuffer), true, state);
     while (finalReader.Read()) ProcessToken(ref finalReader);
 }
 
 Console.WriteLine($"Loaded {total} vectors. Computing dim variance...");
 
-// ── Phase 2: compute per-dim variance using Welford's online algorithm ─────
-// High-variance dims are checked first in ProcessAllDims for maximum early-exit pruning.
+// ── Phase 2: per-dim variance via Welford, derive dimOrder ────────────────
 var mean = new double[Dims];
 var m2   = new double[Dims];
 for (int i = 0; i < total; i++)
@@ -108,121 +97,153 @@ for (int i = 0; i < total; i++)
 }
 var dimVariance = new double[Dims];
 for (int d = 0; d < Dims; d++) dimVariance[d] = m2[d] / total;
-
 var dimOrder = Enumerable.Range(0, Dims).OrderByDescending(d => dimVariance[d]).ToArray();
 Console.WriteLine($"Dim order (high→low variance): [{string.Join(", ", dimOrder)}]");
-for (int i = 0; i < Dims; i++)
-    Console.WriteLine($"  dim[{dimOrder[i],2}] variance={dimVariance[dimOrder[i]]:F2}");
 
-// ── Phase 3: k-means++ on a sample ───────────────────────────────────────
-Console.WriteLine($"Running k-means (K={K})...");
-var rng = new Random(42);
-var sampleIdx = ReservoirSample(total, SampleSize, rng);
-var centroids = RunKMeans(allVecs, sampleIdx, K, KMeansIter, "mixed", rng);
+// ── Phase 3: build VP-tree and write vptree.bin ───────────────────────────
+Console.WriteLine("Building VP-tree...");
+var rng        = new Random(42);
+var nodes      = new List<VpNode>();
+var leafIdxBuf = new List<int>();
 
-// ── Phase 4: assign all vectors to clusters ───────────────────────────────
-Console.WriteLine("Assigning all vectors to clusters...");
-var assignments = new int[total];
-Parallel.For(0, total, i =>
-    assignments[i] = NearestCentroidInRange(allVecs, i * 16, centroids, 0, K));
+var allIndices = new int[total];
+for (int i = 0; i < total; i++) allIndices[i] = i;
 
-// ── Phase 5: group by cluster ─────────────────────────────────────────────
-var clusterMembers = new List<int>[K];
-for (int k = 0; k < K; k++) clusterMembers[k] = new List<int>(total / K + BlockSize);
-for (int i = 0; i < total; i++) clusterMembers[assignments[i]].Add(i);
+BuildNode(allIndices);
 
-// ── Phase 6: write binary ─────────────────────────────────────────────────
-Console.WriteLine("Writing dataset.bin...");
-
-var clusterBlockStart = new int[K];
-var clusterBlockLen   = new int[K];
-int blockCount = 0;
-for (int k = 0; k < K; k++)
-{
-    clusterBlockStart[k] = blockCount;
-    int numBlocks = (clusterMembers[k].Count + BlockSize - 1) / BlockSize;
-    if (numBlocks == 0) numBlocks = 1;
-    clusterBlockLen[k] = numBlocks;
-    blockCount += numBlocks;
-}
-
-var bboxMin = new short[K * Dims];
-var bboxMax = new short[K * Dims];
-Array.Fill(bboxMin, short.MaxValue);
-Array.Fill(bboxMax, short.MinValue);
-for (int k = 0; k < K; k++)
-{
-    var members = clusterMembers[k];
-    if (members.Count == 0)
-    {
-        Array.Fill(bboxMin, (short)0, k * Dims, Dims);
-        Array.Fill(bboxMax, (short)0, k * Dims, Dims);
-        continue;
-    }
-    for (int di = 0; di < Dims; di++)
-    {
-        int d = dimOrder[di];
-        short mn = short.MaxValue, mx = short.MinValue;
-        foreach (int idx in members) { short v = allVecs[idx * 16 + d]; if (v < mn) mn = v; if (v > mx) mx = v; }
-        bboxMin[k * Dims + di] = mn;
-        bboxMax[k * Dims + di] = mx;
-    }
-}
+int nodeCount    = nodes.Count;
+int leafIdxCount = leafIdxBuf.Count;
+Console.WriteLine($"VP-tree built: {nodeCount} nodes, {leafIdxCount} leaf indices");
 
 using var bw = new BinaryWriter(File.Create(output));
 
 // Header
 bw.Write(Magic);
-bw.Write(blockCount);
 bw.Write(total);
-bw.Write(K);
-
-// DimOrder (14 ints) — must match MmapData.cs offset 16
+bw.Write(nodeCount);
+bw.Write(BucketSize);
+bw.Write(leafIdxCount);
 foreach (var d in dimOrder) bw.Write(d);
 
-// Centroids column-major: [dim][centroid] → Dims * K floats
-// Allows AVX FMA scan of 8 centroids per load (sequential memory, no horizontal reduction)
-for (int d = 0; d < Dims; d++)
-    for (int k = 0; k < K; k++)
-        bw.Write(centroids[k * 16 + d]);
-
-// Cluster metadata
-for (int k = 0; k < K; k++) bw.Write(clusterBlockStart[k]);
-for (int k = 0; k < K; k++) bw.Write(clusterBlockLen[k]);
-
-// Bounding boxes (K * Dims shorts each)
-foreach (var v in bboxMin) bw.Write(v);
-foreach (var v in bboxMax) bw.Write(v);
-
-// Blocks (ordered by cluster)
-for (int k = 0; k < K; k++)
+// Nodes (16 bytes each: VpIdxOrCount i32, Threshold f32, Left i32, Right i32)
+foreach (var nd in nodes)
 {
-    var members = clusterMembers[k];
-    int numBlocks = clusterBlockLen[k];
-    for (int bi = 0; bi < numBlocks; bi++)
-        WriteBlock(bw, allVecs, members, bi * BlockSize, Math.Min(BlockSize, members.Count - bi * BlockSize), dimOrder);
+    bw.Write(nd.VpIdxOrCount);
+    bw.Write(nd.Threshold);
+    bw.Write(nd.Left);
+    bw.Write(nd.Right);
 }
 
-// Labels (ordered by cluster, padded with 0)
-for (int k = 0; k < K; k++)
+// Leaf indices
+foreach (var idx in leafIdxBuf) bw.Write(idx);
+
+// Vectors: N × 14 × i16, row-major, variance-ordered dims
+for (int i = 0; i < total; i++)
 {
-    var members = clusterMembers[k];
-    int numBlocks = clusterBlockLen[k];
-    for (int bi = 0; bi < numBlocks; bi++)
-        for (int pos = 0; pos < BlockSize; pos++)
-        {
-            int memberPos = bi * BlockSize + pos;
-            bw.Write(memberPos < members.Count ? allLabels[members[memberPos]] : (byte)0);
-        }
+    int vb = i * 16;
+    for (int di = 0; di < Dims; di++)
+        bw.Write(allVecs[vb + dimOrder[di]]);
 }
 
-Console.WriteLine($"Done. total={total}, K={K}, blockCount={blockCount}");
+// Labels
+for (int i = 0; i < total; i++) bw.Write(allLabels[i]);
 
-// ── Phase 7: build profile fast-path table ────────────────────────────────
+bw.Flush();
+Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB)");
+
+// ── Phase 4: build profile fast-path table ────────────────────────────────
 Console.WriteLine("Building profile fast-path table...");
 BuildFastPath(allVecs, allLabels, total, resourcesPath);
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// ── VP-tree build helpers ─────────────────────────────────────────────────
+
+int BuildNode(int[] indices)
+{
+    int nodeIdx = nodes.Count;
+    nodes.Add(default);
+
+    if (indices.Length <= BucketSize)
+    {
+        int start = leafIdxBuf.Count;
+        foreach (var idx in indices) leafIdxBuf.Add(idx);
+        nodes[nodeIdx] = new VpNode { VpIdxOrCount = indices.Length, Left = start, Right = -1 };
+        return nodeIdx;
+    }
+
+    int vpGlobalIdx = PickVantagePoint(indices);
+
+    // Compute distances from all non-VP points to VP, sort ascending
+    int nonVpCount = indices.Length - 1;
+    var distPairs = new (int idx, long dsq)[nonVpCount];
+    int di = 0;
+    foreach (var idx in indices)
+    {
+        if (idx != vpGlobalIdx)
+            distPairs[di++] = (idx, DistSqInt64(idx, vpGlobalIdx));
+    }
+    Array.Sort(distPairs, (a, b) => a.dsq.CompareTo(b.dsq));
+
+    int mid = Math.Max(1, nonVpCount / 2);
+
+    // Degenerate: right would be empty (shouldn't happen for BucketSize=16 but guard anyway)
+    if (mid >= nonVpCount)
+    {
+        int start = leafIdxBuf.Count;
+        foreach (var idx in indices) leafIdxBuf.Add(idx);
+        nodes[nodeIdx] = new VpNode { VpIdxOrCount = indices.Length, Left = start, Right = -1 };
+        return nodeIdx;
+    }
+
+    float mu = MathF.Sqrt((float)distPairs[mid - 1].dsq) / Scale;
+
+    var leftArr  = new int[mid];
+    var rightArr = new int[nonVpCount - mid];
+    for (int i = 0;   i < mid;          i++) leftArr[i]       = distPairs[i].idx;
+    for (int i = mid; i < nonVpCount;   i++) rightArr[i - mid] = distPairs[i].idx;
+
+    int leftChild  = BuildNode(leftArr);
+    int rightChild = BuildNode(rightArr);
+
+    nodes[nodeIdx] = new VpNode { VpIdxOrCount = vpGlobalIdx, Threshold = mu, Left = leftChild, Right = rightChild };
+    return nodeIdx;
+}
+
+int PickVantagePoint(int[] indices)
+{
+    int sampleSize = Math.Min(5, indices.Length);
+    var sample     = new int[sampleSize];
+    for (int i = 0; i < sampleSize; i++) sample[i] = indices[i];
+    for (int i = sampleSize; i < indices.Length; i++)
+    {
+        int j = rng.Next(i + 1);
+        if (j < sampleSize) sample[j] = indices[i];
+    }
+
+    int bestVp = sample[0];
+    long bestSum = long.MinValue;
+    for (int i = 0; i < sampleSize; i++)
+    {
+        long sum = 0;
+        for (int j = 0; j < sampleSize; j++)
+            if (i != j) sum += DistSqInt64(sample[i], sample[j]);
+        if (sum > bestSum) { bestSum = sum; bestVp = sample[i]; }
+    }
+    return bestVp;
+}
+
+long DistSqInt64(int aIdx, int bIdx)
+{
+    long acc = 0;
+    int ab = aIdx * 16, bb = bIdx * 16;
+    for (int d = 0; d < Dims; d++)
+    {
+        int diff = allVecs[ab + d] - allVecs[bb + d];
+        acc += diff * diff;
+    }
+    return acc;
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────
 
 static short Quantize(double v)
 {
@@ -232,126 +253,10 @@ static short Quantize(double v)
     return (short)q;
 }
 
-static int[] ReservoirSample(int n, int s, Random rng)
-{
-    var result = new int[s];
-    for (int i = 0; i < s && i < n; i++) result[i] = i;
-    for (int i = s; i < n; i++)
-    {
-        int j = rng.Next(i + 1);
-        if (j < s) result[j] = i;
-    }
-    return result;
-}
-
-static float[] KMeansPlusPlusInit(short[] vecs, int[] sample, int k, Random rng)
-{
-    var centroids = new float[k * 16];
-    int first = sample[rng.Next(sample.Length)] * 16;
-    for (int d = 0; d < Dims; d++) centroids[d] = vecs[first + d];
-
-    var minDist = new float[sample.Length];
-    minDist.AsSpan().Fill(float.MaxValue);
-
-    for (int ci = 1; ci < k; ci++)
-    {
-        int prevCBase = (ci - 1) * 16;
-        Parallel.For(0, sample.Length, si =>
-        {
-            float d = CentroidDist(vecs, sample[si] * 16, centroids, prevCBase);
-            if (d < minDist[si]) minDist[si] = d;
-        });
-        float total = 0;
-        for (int si = 0; si < sample.Length; si++) total += minDist[si];
-        float threshold = (float)(rng.NextDouble() * total);
-        float cum = 0;
-        int chosen = sample.Length - 1;
-        for (int si = 0; si < sample.Length; si++)
-        {
-            cum += minDist[si];
-            if (cum >= threshold) { chosen = si; break; }
-        }
-        int vb = sample[chosen] * 16;
-        int cb = ci * 16;
-        for (int d = 0; d < Dims; d++) centroids[cb + d] = vecs[vb + d];
-    }
-    return centroids;
-}
-
-static float CentroidDist(short[] vecs, int vBase, float[] centroids, int cBase)
-{
-    float dist = 0;
-    for (int d = 0; d < Dims; d++)
-    {
-        float diff = vecs[vBase + d] - centroids[cBase + d];
-        dist += diff * diff;
-    }
-    return dist;
-}
-
-static int NearestCentroidInRange(short[] vecs, int vBase, float[] centroids, int start, int count)
-{
-    int best = 0;
-    float bestDist = float.MaxValue;
-    for (int i = 0; i < count; i++)
-    {
-        float dist = CentroidDist(vecs, vBase, centroids, (start + i) * 16);
-        if (dist < bestDist) { bestDist = dist; best = i; }
-    }
-    return best;
-}
-
-static float[] RunKMeans(short[] vecs, int[] sampleIdx, int k, int iters, string label, Random rng)
-{
-    Console.WriteLine($"  K-means {label}: k={k}, sample={sampleIdx.Length}");
-    var centroids = KMeansPlusPlusInit(vecs, sampleIdx, k, rng);
-    var tempAssign = new int[sampleIdx.Length];
-    var newCentroids = new float[k * 16];
-    var counts = new int[k];
-
-    for (int iter = 0; iter < iters; iter++)
-    {
-        Parallel.For(0, sampleIdx.Length, si =>
-            tempAssign[si] = NearestCentroidInRange(vecs, sampleIdx[si] * 16, centroids, 0, k));
-
-        Array.Clear(newCentroids);
-        Array.Clear(counts);
-        for (int si = 0; si < sampleIdx.Length; si++)
-        {
-            int ck = tempAssign[si];
-            int vb = sampleIdx[si] * 16;
-            for (int d = 0; d < Dims; d++)
-                newCentroids[ck * 16 + d] += vecs[vb + d];
-            counts[ck]++;
-        }
-
-        for (int ck = 0; ck < k; ck++)
-        {
-            if (counts[ck] == 0) continue;
-            for (int d = 0; d < Dims; d++)
-                newCentroids[ck * 16 + d] /= counts[ck];
-        }
-        for (int ck = 0; ck < k; ck++)
-        {
-            if (counts[ck] == 0)
-            {
-                int fallback = sampleIdx[rng.Next(sampleIdx.Length)] * 16;
-                for (int d = 0; d < Dims; d++)
-                    newCentroids[ck * 16 + d] = vecs[fallback + d];
-            }
-        }
-        Array.Copy(newCentroids, centroids, k * 16);
-        if ((iter + 1) % 5 == 0) Console.WriteLine($"    {label} iter {iter+1}/{iters}");
-    }
-    return centroids;
-}
-
 static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string resourcesPath)
 {
-    // 22-bit key: booleans get 1 bit, continuous features get proportional bits.
-    // MUST stay in sync with FraudApi/FraudDetection/ProfileFastPath.cs constants.
     int[] featureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
-    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=23 → 8M entries × 2 bytes = 16 MiB
+    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1];
 
     int nf = featureIndex.Length;
     int tableSize = 1 << bits.Sum();
@@ -359,18 +264,15 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     var shifts = new int[nf];
     for (int f = 1; f < nf; f++) shifts[f] = shifts[f - 1] + bits[f - 1];
 
-    // Quantile edges per feature (int16 space)
     var edges = new short[nf][];
     for (int f = 0; f < nf; f++)
     {
         int dim = featureIndex[f];
         int numBins  = 1 << bits[f];
         int numEdges = numBins - 1;
-
         var values = new short[total];
         for (int i = 0; i < total; i++) values[i] = allVecs[i * 16 + dim];
         Array.Sort(values);
-
         edges[f] = new short[numEdges];
         for (int b = 0; b < numEdges; b++)
         {
@@ -379,34 +281,25 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
         }
     }
 
-    // Count total and fraud per bucket.
-    // Packed ulong: upper 32 = total_count, lower 32 = fraud_count.
     var buckets = new Dictionary<uint, ulong>(1 << 20);
     for (int i = 0; i < total; i++)
     {
         uint key = 0;
         for (int f = 0; f < nf; f++)
             key |= (uint)FindBinS(edges[f], allVecs[i * 16 + featureIndex[f]]) << shifts[f];
-
         ulong cur = buckets.TryGetValue(key, out var c) ? c : 0UL;
-        ulong fraudInc = allLabels[i]; // 1 if fraud, 0 if legit
-        buckets[key] = cur + (1UL << 32) + fraudInc;
+        buckets[key] = cur + (1UL << 32) + allLabels[i];
     }
 
-    // Build dense ushort table: entry = (legit << 8) | fraud, each capped independently at 255.
-    // Storing legit+fraud separately avoids precision loss when both exceed 255.
-    // Thresholds are applied at runtime (env vars); we store raw counts here.
     var table = new ushort[tableSize];
     foreach (var kv in buckets)
     {
         long totalL = (long)(kv.Value >> 32);
         long fraudL = (long)(kv.Value & 0xFFFFFFFF);
         long legitL = totalL - fraudL;
-        ushort packed = (ushort)(((uint)Math.Min(legitL, 255) << 8) | (uint)Math.Min(fraudL, 255));
-        table[kv.Key] = packed;
+        table[kv.Key] = (ushort)(((uint)Math.Min(legitL, 255) << 8) | (uint)Math.Min(fraudL, 255));
     }
 
-    // Log estimated hit rate using default runtime thresholds for reference.
     const int defPureLegitMin = 5, defPureFraudMin = 10, defDomMin = 50;
     long hitsPureLegit = 0, hitsPureFraud = 0, hitsDom = 0;
     foreach (var kv in buckets)
@@ -414,18 +307,17 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
         long totalL = (long)(kv.Value >> 32);
         long fraudL = (long)(kv.Value & 0xFFFFFFFF);
         long legitL = totalL - fraudL;
-        if (fraudL == 0 && totalL >= defPureLegitMin)  hitsPureLegit += totalL;
-        else if (legitL == 0 && totalL >= defPureFraudMin) hitsPureFraud += totalL;
-        else if ((fraudL <= 1 || legitL <= 1) && totalL >= defDomMin) hitsDom += totalL;
+        if (fraudL == 0 && totalL >= defPureLegitMin)             hitsPureLegit += totalL;
+        else if (legitL == 0 && totalL >= defPureFraudMin)        hitsPureFraud += totalL;
+        else if ((fraudL <= 1 || legitL <= 1) && totalL >= defDomMin) hitsDom   += totalL;
     }
     long totalHits = hitsPureLegit + hitsPureFraud + hitsDom;
-    Console.WriteLine($"  Fast-path coverage (default thresholds): {totalHits * 100.0 / total:F1}%  " +
+    Console.WriteLine($"  Fast-path coverage: {totalHits * 100.0 / total:F1}%  " +
                       $"(pure-legit={hitsPureLegit}, pure-fraud={hitsPureFraud}, dominant={hitsDom})");
 
-    // Write fastpath.bin — magic 0x46415332 ("FAS2"), edges, then uint table.
     var outputPath = Path.Combine(resourcesPath, "fastpath.bin");
     using var bw2 = new BinaryWriter(File.Create(outputPath));
-    bw2.Write(unchecked((int)0x46415333)); // "FAS3"
+    bw2.Write(unchecked((int)0x46415333));
     for (int f = 0; f < nf; f++)
     {
         bw2.Write(edges[f].Length);
@@ -443,16 +335,11 @@ static int FindBinS(short[] edges, short v)
     return edges.Length;
 }
 
-static unsafe void WriteBlock(BinaryWriter bw, short[] vecs, List<int> members, int start, int realCount, int[] dimOrder)
+[StructLayout(LayoutKind.Sequential, Size = 16)]
+struct VpNode
 {
-    Block b = default;
-    short* ptr = (short*)&b;
-    for (int pos = 0; pos < BlockSize; pos++)
-    {
-        int memberPos = start + pos;
-        int vb = memberPos < members.Count ? members[memberPos] * 16 : -1;
-        for (int di = 0; di < Dims; di++)
-            ptr[di * BlockSize + pos] = vb >= 0 ? vecs[vb + dimOrder[di]] : PaddingSentinel;
-    }
-    bw.Write(new ReadOnlySpan<byte>(ptr, sizeof(Block)));
+    public int   VpIdxOrCount;
+    public float Threshold;
+    public int   Left;
+    public int   Right;
 }

@@ -27,24 +27,12 @@ var normalization = JsonSerializer.Deserialize(
     AppJsonSerializerContext.Default.NormalizationConfig
 )!;
 
-var nprobe = int.TryParse(Environment.GetEnvironmentVariable("NPROBE"), out var np) ? np : 1;
-var nprobeRetry = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_RETRY"), out var nr) ? nr : 64;
-var nprobeExhaust = int.TryParse(Environment.GetEnvironmentVariable("NPROBE_EXHAUST"), out var ne) ? ne : 512;
+var mmap = MmapData.Load(Path.Combine(resourcesPath, "vptree.bin"));
+FraudHandler.MmapRef = mmap;
+FraudHandler.Engine  = mmap.CreateEngine();
 
-unsafe
-{
-    var mmap = MmapData.Load(Path.Combine(resourcesPath, "dataset.bin"));
-    FraudHandler.MmapRef = mmap;
-    FraudHandler.Engine = new SearchEngine(
-        mmap.Blocks, mmap.Labels, mmap.Centroids,
-        mmap.ClusterBlockStart, mmap.ClusterBlockLen,
-        mmap.BboxMin, mmap.BboxMax, mmap.K,
-        nprobe, nprobeRetry, nprobeExhaust, mmap.DimOrder
-    );
-}
-
-FraudHandler.MccRisk = mccRisk;
-FraudHandler.Norm = normalization;
+FraudHandler.MccRisk   = mccRisk;
+FraudHandler.Norm      = normalization;
 FraudHandler.Responses = BuildResponses();
 
 var mccLut = new short[10000];

@@ -6,9 +6,10 @@ riderModule.iml
 .idea
 
 resources/dataset.bin
+resources/vptree.bin
 resources/fastpath.bin
 resources/references.json.gz
-resources/references.jsonCLAUDE.md
+resources/references.json
 
 # Zig build artifacts
 lb/.zig-cache/
