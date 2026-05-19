@@ -44,6 +44,7 @@ public sealed unsafe class VpTreeEngine
     {
         Span<short> q = stackalloc short[16];
         for (int di = 0; di < 14; di++) q[di] = query[_dimOrder[di]];
+        q[14] = 0; q[15] = 0; // padding for 16-wide SIMD DistNorm
 
         Span<float> qf = stackalloc float[16];
         for (int di = 0; di < 14; di++) qf[di] = q[di] * InvScale;
@@ -161,9 +162,13 @@ public sealed unsafe class VpTreeEngine
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float DistNorm(short* q, short* v)
     {
-        long acc = 0;
-        for (int d = 0; d < 14; d++) { int diff = q[d] - v[d]; acc += diff * diff; }
-        return MathF.Sqrt((float)acc) * InvScale;
+        // One 256-bit pass over 16 shorts (14 dims + 2 zeros in padding)
+        var d    = Avx2.Subtract(Vector256.Load(q), Vector256.Load(v));
+        var acc8 = Avx2.MultiplyAddAdjacent(d, d); // 8 × int32
+        var sum4 = Sse2.Add(acc8.GetLower(), acc8.GetUpper());
+        var s2   = Sse2.Add(sum4, Sse2.Shuffle(sum4, 0b_01_00_11_10));
+        var s1   = Sse2.Add(s2,   Sse2.Shuffle(s2,   0b_10_11_00_01));
+        return MathF.Sqrt((float)s1.GetElement(0)) * InvScale;
     }
 }
 
