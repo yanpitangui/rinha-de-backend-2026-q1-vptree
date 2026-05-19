@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Text.Json;
 using FraudApi.Config;
 
@@ -9,6 +11,24 @@ public static class DirectHandler
 {
     private static readonly int[] s_dowTab = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     private static readonly int[] s_doy    = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+    // Precomputed inverse normalization constants for SIMD batch:
+    // [1/MaxAmount, 1/MaxInstallments, 1/AmountVsAvgRatio, 1/MaxMinutes,
+    //  1/MaxKm, 1/MaxKm, 1/MaxTxCount24h, 1/MaxMerchantAvgAmount]
+    private static Vector256<float> s_invMul;
+
+    public static void Init(NormalizationConfig n)
+    {
+        s_invMul = Vector256.Create(
+            1f / (float)n.MaxAmount,
+            1f / (float)n.MaxInstallments,
+            1f / (float)n.AmountVsAvgRatio,
+            1f / (float)n.MaxMinutes,
+            1f / (float)n.MaxKm,
+            1f / (float)n.MaxKm,
+            1f / (float)n.MaxTxCount24h,
+            1f / (float)n.MaxMerchantAvgAmount);
+    }
 
     internal static int ComputeIndex(ReadOnlySpan<byte> body)
     {
@@ -258,27 +278,9 @@ public static class DirectHandler
 
         const int Scale = Vectorizer.Scale;
 
-        dst[0] = Q(Clamp(amount / (float)n.MaxAmount));
-        dst[1] = Q(Clamp(installments / (float)n.MaxInstallments));
-        dst[2] = Q(Clamp(amount / avgAmount / (float)n.AmountVsAvgRatio));
-
         var (hour, dow) = ParseUtcHourDow(reqAt);
         dst[3] = Vectorizer.HourLut[hour];
         dst[4] = Vectorizer.DowLut[dow];
-
-        if (!hasLastTx)
-        {
-            dst[5] = (short)(-Scale);
-            dst[6] = (short)(-Scale);
-        }
-        else
-        {
-            dst[5] = Q(Clamp(MinutesDiff(lastAt, reqAt) / (float)n.MaxMinutes));
-            dst[6] = Q(Clamp(kmFromCurrent / (float)n.MaxKm));
-        }
-
-        dst[7]  = Q(Clamp(kmFromHome / (float)n.MaxKm));
-        dst[8]  = Q(Clamp(txCount24h / (float)n.MaxTxCount24h));
         dst[9]  = isOnline ? (short)Scale : (short)0;
         dst[10] = cardPresent ? (short)Scale : (short)0;
 
@@ -294,9 +296,52 @@ public static class DirectHandler
         }
         dst[11] = knownMerchant ? (short)0 : (short)Scale;
         dst[12] = FraudHandler.MccLut[mcc];
-        dst[13] = Q(Clamp(merchantAvgAmount / (float)n.MaxMerchantAvgAmount));
         dst[14] = 0;
         dst[15] = 0;
+
+        if (Avx2.IsSupported)
+        {
+            float minutesDiff = hasLastTx ? MinutesDiff(lastAt, reqAt) : 0f;
+            float kmCurrent   = hasLastTx ? kmFromCurrent : 0f;
+
+            // 8 dims in one AVX2 pass: [amount, installments, ratio, minutes, kmCurrent, kmHome, txCount, merchantAvg]
+            var vals      = Vector256.Create(amount, (float)installments, amount / avgAmount,
+                                             minutesDiff, kmCurrent, kmFromHome,
+                                             (float)txCount24h, merchantAvgAmount);
+            var clamped   = Avx.Max(Vector256<float>.Zero, Avx.Min(Avx.Multiply(vals, s_invMul), Vector256.Create(1f)));
+            // VCVTPS2DQ rounds to nearest-even, matching MathF.Round behavior
+            var quantized = Avx.ConvertToVector256Int32(Avx.Multiply(clamped, Vector256.Create((float)Scale)));
+            var packed    = Sse2.PackSignedSaturate(quantized.GetLower(), quantized.GetUpper());
+
+            dst[0]  = (short)packed.GetElement(0);
+            dst[1]  = (short)packed.GetElement(1);
+            dst[2]  = (short)packed.GetElement(2);
+            dst[7]  = (short)packed.GetElement(5);
+            dst[8]  = (short)packed.GetElement(6);
+            dst[13] = (short)packed.GetElement(7);
+
+            if (!hasLastTx) { dst[5] = (short)(-Scale); dst[6] = (short)(-Scale); }
+            else            { dst[5] = (short)packed.GetElement(3); dst[6] = (short)packed.GetElement(4); }
+        }
+        else
+        {
+            dst[0] = Q(Clamp(amount / (float)n.MaxAmount));
+            dst[1] = Q(Clamp(installments / (float)n.MaxInstallments));
+            dst[2] = Q(Clamp(amount / avgAmount / (float)n.AmountVsAvgRatio));
+            if (!hasLastTx)
+            {
+                dst[5] = (short)(-Scale);
+                dst[6] = (short)(-Scale);
+            }
+            else
+            {
+                dst[5] = Q(Clamp(MinutesDiff(lastAt, reqAt) / (float)n.MaxMinutes));
+                dst[6] = Q(Clamp(kmFromCurrent / (float)n.MaxKm));
+            }
+            dst[7]  = Q(Clamp(kmFromHome / (float)n.MaxKm));
+            dst[8]  = Q(Clamp(txCount24h / (float)n.MaxTxCount24h));
+            dst[13] = Q(Clamp(merchantAvgAmount / (float)n.MaxMerchantAvgAmount));
+        }
 
         return true;
     }

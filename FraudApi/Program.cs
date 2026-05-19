@@ -33,6 +33,7 @@ FraudHandler.Engine  = mmap.CreateEngine();
 
 FraudHandler.MccRisk   = mccRisk;
 FraudHandler.Norm      = normalization;
+DirectHandler.Init(normalization);
 FraudHandler.Responses = BuildResponses();
 
 var mccLut = new short[10000];
