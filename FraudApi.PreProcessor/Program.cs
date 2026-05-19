@@ -1,11 +1,13 @@
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using FraudApi.Shared;
 
-const int Scale      = 10000;
-const int Dims       = 14;
-const int BucketSize = 16;
-const int Magic      = 0x56505452; // "VPTR"
+const int   Scale           = 10000;
+const int   Dims            = 14;
+const int   BucketSize      = 64;
+const int   Magic           = 0x56505453; // "VPTS"
+const short PaddingSentinel = Scale;      // > any valid value → large distance → never enters heap
 
 var resourcesPath =
     args.Length > 0
@@ -18,19 +20,19 @@ var output = Path.Combine(resourcesPath, "vptree.bin");
 
 Console.WriteLine($"Loading dataset from: {input}");
 
-// ── Phase 1: stream all vectors into flat row-major arrays ────────────────
+// ── Phase 1: stream all vectors ───────────────────────────────────────────
 const int MaxVectors = 3_100_000;
-var allVecs   = new short[MaxVectors * 16]; // row-major: allVecs[i*16+d]
+var allVecs   = new short[MaxVectors * 16];
 var allLabels = new byte[MaxVectors];
 int total = 0;
 
 {
-    using var fs  = File.OpenRead(input);
-    using var gz  = new GZipStream(fs, CompressionMode.Decompress);
+    using var fs = File.OpenRead(input);
+    using var gz = new GZipStream(fs, CompressionMode.Decompress);
 
-    byte[] buffer      = new byte[64 * 1024];
-    int bytesInBuffer  = 0;
-    var state          = new JsonReaderState();
+    byte[] buffer     = new byte[64 * 1024];
+    int bytesInBuffer = 0;
+    var state         = new JsonReaderState();
 
     double[] vec = new double[Dims];
     bool inVector = false;
@@ -81,7 +83,7 @@ int total = 0;
 
 Console.WriteLine($"Loaded {total} vectors. Computing dim variance...");
 
-// ── Phase 2: per-dim variance via Welford, derive dimOrder ────────────────
+// ── Phase 2: per-dim variance → dimOrder ─────────────────────────────────
 var mean = new double[Dims];
 var m2   = new double[Dims];
 for (int i = 0; i < total; i++)
@@ -89,10 +91,10 @@ for (int i = 0; i < total; i++)
     int vb = i * 16;
     for (int d = 0; d < Dims; d++)
     {
-        double x = allVecs[vb + d];
+        double x     = allVecs[vb + d];
         double delta = x - mean[d];
         mean[d] += delta / (i + 1);
-        m2[d] += delta * (x - mean[d]);
+        m2[d]   += delta * (x - mean[d]);
     }
 }
 var dimVariance = new double[Dims];
@@ -100,32 +102,50 @@ for (int d = 0; d < Dims; d++) dimVariance[d] = m2[d] / total;
 var dimOrder = Enumerable.Range(0, Dims).OrderByDescending(d => dimVariance[d]).ToArray();
 Console.WriteLine($"Dim order (high→low variance): [{string.Join(", ", dimOrder)}]");
 
-// ── Phase 3: build VP-tree and write vptree.bin ───────────────────────────
+// ── Phase 3: build VP-tree ────────────────────────────────────────────────
 Console.WriteLine("Building VP-tree...");
-var rng        = new Random(42);
-var nodes      = new List<VpNode>();
-var leafIdxBuf = new List<int>();
+
+var rng          = new Random(42);
+var nodes        = new List<VpNode>();
+var vpVecsList   = new List<short>();   // internalCount × 14 shorts
+var vpLabelsList = new List<byte>();    // internalCount bytes
+int internalCount  = 0;
+int leafBlockCount = 0;
+
+// Leaf data buffered to streams — written after nodes/vpVecs in the final file
+var leafBlocksMs = new MemoryStream();
+var leafLabelsMs = new MemoryStream();
+var bwLB = new BinaryWriter(leafBlocksMs);
+var bwLL = new BinaryWriter(leafLabelsMs);
 
 var allIndices = new int[total];
 for (int i = 0; i < total; i++) allIndices[i] = i;
-
 BuildNode(allIndices);
 
-int nodeCount    = nodes.Count;
-int leafIdxCount = leafIdxBuf.Count;
-Console.WriteLine($"VP-tree built: {nodeCount} nodes, {leafIdxCount} leaf indices");
+bwLB.Flush(); bwLL.Flush();
+
+int nodeCount = nodes.Count;
+Console.WriteLine($"VP-tree built: {nodeCount} nodes ({internalCount} internal, {nodeCount - internalCount} leaves), {leafBlockCount} leaf blocks");
+
+// ── Phase 4: write vptree.bin ─────────────────────────────────────────────
+// Layout:
+//   [4B] magic  [4B] N  [4B] nodeCount  [4B] bucketSize  [4B] internalCount  [4B] leafBlockCount
+//   [14×4B] dimOrder
+//   nodes:      nodeCount × 16B
+//   vpVecs:     internalCount × 14 × 2B  (row-major, variance-ordered)
+//   vpLabels:   internalCount × 1B
+//   leafBlocks: leafBlockCount × sizeof(Block)  (= ×224B, column-major 8-wide)
+//   leafLabels: leafBlockCount × 8B
 
 using var bw = new BinaryWriter(File.Create(output));
-
-// Header
 bw.Write(Magic);
 bw.Write(total);
 bw.Write(nodeCount);
 bw.Write(BucketSize);
-bw.Write(leafIdxCount);
+bw.Write(internalCount);
+bw.Write(leafBlockCount);
 foreach (var d in dimOrder) bw.Write(d);
 
-// Nodes (16 bytes each: VpIdxOrCount i32, Threshold f32, Left i32, Right i32)
 foreach (var nd in nodes)
 {
     bw.Write(nd.VpIdxOrCount);
@@ -134,24 +154,18 @@ foreach (var nd in nodes)
     bw.Write(nd.Right);
 }
 
-// Leaf indices
-foreach (var idx in leafIdxBuf) bw.Write(idx);
+foreach (var v in vpVecsList)   bw.Write(v);
+foreach (var v in vpLabelsList) bw.Write(v);
 
-// Vectors: N × 14 × i16, row-major, variance-ordered dims
-for (int i = 0; i < total; i++)
-{
-    int vb = i * 16;
-    for (int di = 0; di < Dims; di++)
-        bw.Write(allVecs[vb + dimOrder[di]]);
-}
-
-// Labels
-for (int i = 0; i < total; i++) bw.Write(allLabels[i]);
-
+var leafBlocksBytes = leafBlocksMs.ToArray();
+var leafLabelsBytes = leafLabelsMs.ToArray();
+bw.Write(leafBlocksBytes);
+bw.Write(leafLabelsBytes);
 bw.Flush();
+
 Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB)");
 
-// ── Phase 4: build profile fast-path table ────────────────────────────────
+// ── Phase 5: build profile fast-path table ────────────────────────────────
 Console.WriteLine("Building profile fast-path table...");
 BuildFastPath(allVecs, allLabels, total, resourcesPath);
 
@@ -164,33 +178,79 @@ int BuildNode(int[] indices)
 
     if (indices.Length <= BucketSize)
     {
-        int start = leafIdxBuf.Count;
-        foreach (var idx in indices) leafIdxBuf.Add(idx);
-        nodes[nodeIdx] = new VpNode { VpIdxOrCount = indices.Length, Left = start, Right = -1 };
+        // Leaf: pack into column-major Block(s) of 8
+        int blockStart = leafBlockCount;
+        int nBlocks    = (indices.Length + 7) / 8;
+
+        for (int bi = 0; bi < nBlocks; bi++)
+        {
+            // 14 dims × 8 positions (column-major = Block layout)
+            for (int di = 0; di < Dims; di++)
+                for (int pos = 0; pos < 8; pos++)
+                {
+                    int mi = bi * 8 + pos;
+                    short v = mi < indices.Length
+                        ? allVecs[indices[mi] * 16 + dimOrder[di]]
+                        : PaddingSentinel;
+                    bwLB.Write(v);
+                }
+            // Labels for this block's 8 slots
+            for (int pos = 0; pos < 8; pos++)
+            {
+                int mi = bi * 8 + pos;
+                bwLL.Write(mi < indices.Length ? allLabels[indices[mi]] : (byte)0);
+            }
+        }
+        leafBlockCount += nBlocks;
+
+        nodes[nodeIdx] = new VpNode { VpIdxOrCount = nBlocks, Left = blockStart, Right = -1 };
         return nodeIdx;
     }
 
+    // Internal node
+    int myVpIdx    = internalCount++;
     int vpGlobalIdx = PickVantagePoint(indices);
 
-    // Compute distances from all non-VP points to VP, sort ascending
+    // Store VP vector (variance-ordered) and label
+    for (int di = 0; di < Dims; di++)
+        vpVecsList.Add(allVecs[vpGlobalIdx * 16 + dimOrder[di]]);
+    vpLabelsList.Add(allLabels[vpGlobalIdx]);
+
+    // Partition non-VP points by distance to VP
     int nonVpCount = indices.Length - 1;
-    var distPairs = new (int idx, long dsq)[nonVpCount];
-    int di = 0;
+    var distPairs  = new (int idx, long dsq)[nonVpCount];
+    int di2 = 0;
     foreach (var idx in indices)
-    {
         if (idx != vpGlobalIdx)
-            distPairs[di++] = (idx, DistSqInt64(idx, vpGlobalIdx));
-    }
+            distPairs[di2++] = (idx, DistSqInt64(idx, vpGlobalIdx));
     Array.Sort(distPairs, (a, b) => a.dsq.CompareTo(b.dsq));
 
     int mid = Math.Max(1, nonVpCount / 2);
 
-    // Degenerate: right would be empty (shouldn't happen for BucketSize=16 but guard anyway)
     if (mid >= nonVpCount)
     {
-        int start = leafIdxBuf.Count;
-        foreach (var idx in indices) leafIdxBuf.Add(idx);
-        nodes[nodeIdx] = new VpNode { VpIdxOrCount = indices.Length, Left = start, Right = -1 };
+        // Degenerate: fall back to leaf with all including VP
+        int blockStart = leafBlockCount;
+        int nBlocks    = (indices.Length + 7) / 8;
+        for (int bi = 0; bi < nBlocks; bi++)
+        {
+            for (int di = 0; di < Dims; di++)
+                for (int pos = 0; pos < 8; pos++)
+                {
+                    int mi = bi * 8 + pos;
+                    short v = mi < indices.Length
+                        ? allVecs[indices[mi] * 16 + dimOrder[di]]
+                        : PaddingSentinel;
+                    bwLB.Write(v);
+                }
+            for (int pos = 0; pos < 8; pos++)
+            {
+                int mi = bi * 8 + pos;
+                bwLL.Write(mi < indices.Length ? allLabels[indices[mi]] : (byte)0);
+            }
+        }
+        leafBlockCount += nBlocks;
+        nodes[nodeIdx] = new VpNode { VpIdxOrCount = nBlocks, Left = blockStart, Right = -1 };
         return nodeIdx;
     }
 
@@ -198,13 +258,13 @@ int BuildNode(int[] indices)
 
     var leftArr  = new int[mid];
     var rightArr = new int[nonVpCount - mid];
-    for (int i = 0;   i < mid;          i++) leftArr[i]       = distPairs[i].idx;
-    for (int i = mid; i < nonVpCount;   i++) rightArr[i - mid] = distPairs[i].idx;
+    for (int i = 0;   i < mid;        i++) leftArr[i]        = distPairs[i].idx;
+    for (int i = mid; i < nonVpCount; i++) rightArr[i - mid] = distPairs[i].idx;
 
     int leftChild  = BuildNode(leftArr);
     int rightChild = BuildNode(rightArr);
 
-    nodes[nodeIdx] = new VpNode { VpIdxOrCount = vpGlobalIdx, Threshold = mu, Left = leftChild, Right = rightChild };
+    nodes[nodeIdx] = new VpNode { VpIdxOrCount = myVpIdx, Threshold = mu, Left = leftChild, Right = rightChild };
     return nodeIdx;
 }
 
@@ -218,7 +278,6 @@ int PickVantagePoint(int[] indices)
         int j = rng.Next(i + 1);
         if (j < sampleSize) sample[j] = indices[i];
     }
-
     int bestVp = sample[0];
     long bestSum = long.MinValue;
     for (int i = 0; i < sampleSize; i++)
@@ -258,7 +317,7 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     int[] featureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
     int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1];
 
-    int nf = featureIndex.Length;
+    int nf        = featureIndex.Length;
     int tableSize = 1 << bits.Sum();
 
     var shifts = new int[nf];
@@ -267,10 +326,10 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     var edges = new short[nf][];
     for (int f = 0; f < nf; f++)
     {
-        int dim = featureIndex[f];
+        int dim      = featureIndex[f];
         int numBins  = 1 << bits[f];
         int numEdges = numBins - 1;
-        var values = new short[total];
+        var values   = new short[total];
         for (int i = 0; i < total; i++) values[i] = allVecs[i * 16 + dim];
         Array.Sort(values);
         edges[f] = new short[numEdges];
@@ -307,9 +366,9 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
         long totalL = (long)(kv.Value >> 32);
         long fraudL = (long)(kv.Value & 0xFFFFFFFF);
         long legitL = totalL - fraudL;
-        if (fraudL == 0 && totalL >= defPureLegitMin)             hitsPureLegit += totalL;
-        else if (legitL == 0 && totalL >= defPureFraudMin)        hitsPureFraud += totalL;
-        else if ((fraudL <= 1 || legitL <= 1) && totalL >= defDomMin) hitsDom   += totalL;
+        if (fraudL == 0 && totalL >= defPureLegitMin)                 hitsPureLegit += totalL;
+        else if (legitL == 0 && totalL >= defPureFraudMin)            hitsPureFraud += totalL;
+        else if ((fraudL <= 1 || legitL <= 1) && totalL >= defDomMin) hitsDom       += totalL;
     }
     long totalHits = hitsPureLegit + hitsPureFraud + hitsDom;
     Console.WriteLine($"  Fast-path coverage: {totalHits * 100.0 / total:F1}%  " +
@@ -338,8 +397,8 @@ static int FindBinS(short[] edges, short v)
 [StructLayout(LayoutKind.Sequential, Size = 16)]
 struct VpNode
 {
-    public int   VpIdxOrCount;
-    public float Threshold;
-    public int   Left;
-    public int   Right;
+    public int   VpIdxOrCount; // internal: index into vpVecs; leaf: block count
+    public float Threshold;    // internal: mu (normalized linear dist)
+    public int   Left;         // internal: left child node idx; leaf: blockStart
+    public int   Right;        // internal: right child node idx; leaf: -1
 }
