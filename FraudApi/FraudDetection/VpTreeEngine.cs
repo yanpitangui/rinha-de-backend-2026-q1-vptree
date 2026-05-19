@@ -83,6 +83,8 @@ public sealed unsafe class VpTreeEngine
                 if (vpDist <= mu) { near = node->Left;  far = node->Right; gap = mu - vpDist; }
                 else              { near = node->Right; far = node->Left;  gap = vpDist - mu; }
 
+                Sse.Prefetch0(_nodes + near);
+
                 stack[top++] = new StackEntry(far,  gap);
                 stack[top++] = new StackEntry(near, 0f);
             }
