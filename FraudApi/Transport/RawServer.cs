@@ -33,6 +33,10 @@ public static class RawServer
     private const int MsgNosignal = 0x4000;
     private const int IpprotoTcp = 6;
     private const int TcpNodelay = 1;
+    private const int SoBusyPoll = 46;
+
+    private static readonly int s_busyPollUs =
+        int.TryParse(Environment.GetEnvironmentVariable("SO_BUSY_POLL"), out var bp) && bp > 0 ? bp : 0;
 
     [DllImport("libc", SetLastError = true)]
     private static extern unsafe nint recvmsg(int sockfd, MsgHdr* msg, int flags);
@@ -128,6 +132,11 @@ public static class RawServer
     {
         int one = 1;
         setsockopt(fd, IpprotoTcp, TcpNodelay, &one, 4);
+        if (s_busyPollUs > 0)
+        {
+            int us = s_busyPollUs;
+            setsockopt(fd, SolSocket, SoBusyPoll, &us, 4);
+        }
 
         const int BufSize = 4096;
         const int MsgWaitAll = 0x100;

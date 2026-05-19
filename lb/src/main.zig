@@ -101,7 +101,7 @@ pub fn main() !void {
     std.debug.print("lb: listening on :{d}\n", .{LISTEN_PORT});
 
     std.debug.print("lb: waiting for backends...\n", .{});
-    var ctrl_fds: [2]i32 = undefined;
+    var ctrl_fds: [2]i32 = .{ -1, -1 };
     for (CTRL_SOCKETS, 0..) |path, i| {
         ctrl_fds[i] = try connectWithRetry(path);
         std.debug.print("lb: connected to {s}\n", .{path});
@@ -117,10 +117,25 @@ pub fn main() !void {
         const ret = linux.accept4(server_fd, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(ret) != .SUCCESS) continue;
         const client_fd: i32 = @intCast(ret);
-        const ctrl_fd = ctrl_fds[counter & 1];
+        const idx: usize = counter & 1;
         counter += 1;
+
+        // Reconnect if the control socket died (API restarted).
+        if (ctrl_fds[idx] < 0) {
+            if (connectUnix(CTRL_SOCKETS[idx])) |new_fd| {
+                ctrl_fds[idx] = new_fd;
+                std.debug.print("lb: reconnected to {s}\n", .{CTRL_SOCKETS[idx]});
+            } else |_| {}
+        }
+
+        // Pick target: prefer assigned backend, fall back to the other one.
+        const ctrl_fd = if (ctrl_fds[idx] >= 0) ctrl_fds[idx] else ctrl_fds[idx ^ 1];
+
         passfd(ctrl_fd, client_fd) catch |err| {
-            std.debug.print("lb: passfd: {}\n", .{err});
+            std.debug.print("lb: passfd[{}]: {}\n", .{idx, err});
+            // Mark dead; attempt reconnect on next request for this slot.
+            _ = linux.close(ctrl_fds[idx]);
+            ctrl_fds[idx] = -1;
         };
         _ = linux.close(client_fd);
     }

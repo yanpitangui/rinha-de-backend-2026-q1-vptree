@@ -23,8 +23,11 @@ services:
       context: .
       dockerfile: Dockerfile
     hostname: api1
+    cpuset: "0,1"
     environment:
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-150}
+      - DOTNET_PROCESSOR_COUNT=1
+      - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -44,8 +47,11 @@ services:
       context: .
       dockerfile: Dockerfile
     hostname: api2
+    cpuset: "2,3"
     environment:
-      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
+      - TP_MIN_WORKERS=${TP_MIN_WORKERS:-150}
+      - DOTNET_PROCESSOR_COUNT=1
+      - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
     volumes:
       - uds-sockets:/sockets
     healthcheck:
