@@ -84,17 +84,17 @@ public static class RawServer
         System.Diagnostics.Process.Start("chmod", $"777 {socketPath}")?.WaitForExit();
         Console.WriteLine($"raw: bound {socketPath}");
 
-        // Accept single persistent control connection from LB (blocking).
-        // GC.KeepAlive pins the Socket objects through the blocking calls so
-        // NativeAOT doesn't finalize (close) them before we're done.
-        var ctrl = server.Accept();
-        GC.KeepAlive(server);
-        var ctrlFd = (int)ctrl.SafeHandle.DangerousGetHandle();
-        Console.WriteLine("raw: lb connected");
-
-        RecvLoop(ctrlFd);
-        GC.KeepAlive(ctrl);
-        Console.Error.WriteLine("raw: control lost, exiting");
+        // Accept one ctrl connection per LB worker; each gets its own RecvLoop thread.
+        while (true)
+        {
+            var ctrl = server.Accept();
+            GC.KeepAlive(server);
+            var ctrlFd = (int)ctrl.SafeHandle.DangerousGetHandle();
+            Console.WriteLine("raw: lb worker connected");
+            var t = new Thread(() => { RecvLoop(ctrlFd); GC.KeepAlive(ctrl); });
+            t.IsBackground = true;
+            t.Start();
+        }
     }
 
     private static unsafe void RecvLoop(int ctrlFd)

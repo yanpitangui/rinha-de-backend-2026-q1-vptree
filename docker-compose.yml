@@ -7,6 +7,9 @@ services:
       - "9999:9999"
     volumes:
       - uds-sockets:/sockets
+    cpuset: "0,1,2,3"
+    environment:
+      - LB_WORKERS=${LB_WORKERS:-2}
     depends_on:
       api1:
         condition: service_healthy
