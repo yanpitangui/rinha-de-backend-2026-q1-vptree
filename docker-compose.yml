@@ -43,6 +43,11 @@ services:
       timeout: 3s
       retries: 30
       start_period: 60s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock: -1
     deploy:
       resources:
         limits:
@@ -67,6 +72,11 @@ services:
       timeout: 3s
       retries: 30
       start_period: 60s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock: -1
     deploy:
       resources:
         limits:

@@ -94,6 +94,11 @@ fn makeListener() !i32 {
     try checkErrno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)));
     try checkErrno(linux.listen(fd, BACKLOG));
 
+    // Wake epoll only when request data has arrived, not on bare SYN.
+    // Guarantees API's first recv() finds data already in socket buffer.
+    var defer_secs: i32 = 1;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.DEFER_ACCEPT, @ptrCast(&defer_secs), @sizeOf(i32));
+
     return fd;
 }
 

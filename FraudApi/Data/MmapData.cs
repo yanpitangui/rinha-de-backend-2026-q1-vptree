@@ -14,6 +14,7 @@ namespace FraudApi.Data;
 public sealed unsafe class MmapData
 {
     [DllImport("libc")] private static extern int madvise(void* addr, nuint length, int advice);
+    [DllImport("libc")] private static extern int mlock(void* addr, nuint length);
     private const int MadvHugePage = 14;
     private const int Magic        = 0x56505454; // "VPTT"
 
@@ -44,6 +45,7 @@ public sealed unsafe class MmapData
             madvise(p, (nuint)fileSize, MadvHugePage);
             for (long i = 0; i < fileSize; i += 4096)
                 _ = p[i];
+            mlock(p, (nuint)fileSize);
         }
 
         fixed (byte* ptr = &MemoryMarshal.GetArrayDataReference(data))
