@@ -13,6 +13,10 @@ services:
         condition: service_healthy
       api2:
         condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -35,6 +39,10 @@ services:
       timeout: 3s
       retries: 30
       start_period: 60s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -57,6 +65,10 @@ services:
       timeout: 3s
       retries: 30
       start_period: 60s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
