@@ -100,8 +100,6 @@ public sealed unsafe class VpTreeEngine
 
         for (int bi = 0; bi < blockCount; bi++)
         {
-            if (bi + 1 < blockCount)
-                Sse.Prefetch0(_leafBlocks + blockStart + bi + 1);
             Block* block = _leafBlocks + blockStart + bi;
             if (!ProcessBlock(block, qf, dptr, boundSq)) continue;
 
