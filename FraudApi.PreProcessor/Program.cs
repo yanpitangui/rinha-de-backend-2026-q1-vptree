@@ -6,7 +6,7 @@ using FraudApi.Shared;
 const int   Scale           = 10000;
 const int   Dims            = 14;
 const int   BucketSize      = 128;
-const int   VpSampleSize    = 20;         // candidates sampled per node for vantage point selection
+const int   VpSampleSize    = 100;        // candidates sampled per node for vantage point selection
 const int   Magic           = 0x56505454; // "VPTT"
 const short PaddingSentinel = Scale;      // > any valid value → large distance → never enters heap
 
