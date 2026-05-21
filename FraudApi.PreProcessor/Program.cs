@@ -8,7 +8,7 @@ const int   Dims            = 14;
 const int   BucketSize      = 128;
 const int   VpSampleSize    = 20;         // candidates sampled per node for vantage point selection
 const int   Magic           = 0x56505454; // "VPTT"
-const short PaddingSentinel = Scale;      // > any valid value → large distance → never enters heap
+const short PaddingSentinel = short.MaxValue; // well outside [0,Scale] → guaranteed large distance → never enters heap
 
 var resourcesPath =
     args.Length > 0
@@ -370,16 +370,17 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
         table[kv.Key] = (ushort)(((uint)Math.Min(legitL, 255) << 8) | (uint)Math.Min(fraudL, 255));
     }
 
-    const int defPureLegitMin = 5, defPureFraudMin = 10, defDomMin = 50;
+    // Must match ProfileFastPath.cs defaults (domLegit disabled = int.MaxValue)
+    const int defPureLegitMin = 100, defPureFraudMin = 20, defDomFraudMin = 100;
     long hitsPureLegit = 0, hitsPureFraud = 0, hitsDom = 0;
     foreach (var kv in buckets)
     {
         long totalL = (long)(kv.Value >> 32);
         long fraudL = (long)(kv.Value & 0xFFFFFFFF);
         long legitL = totalL - fraudL;
-        if (fraudL == 0 && totalL >= defPureLegitMin)                 hitsPureLegit += totalL;
-        else if (legitL == 0 && totalL >= defPureFraudMin)            hitsPureFraud += totalL;
-        else if ((fraudL <= 1 || legitL <= 1) && totalL >= defDomMin) hitsDom       += totalL;
+        if (fraudL == 0 && totalL >= defPureLegitMin)               hitsPureLegit += totalL;
+        else if (legitL == 0 && totalL >= defPureFraudMin)          hitsPureFraud += totalL;
+        else if (legitL == 1 && totalL >= defDomFraudMin)           hitsDom       += totalL; // domFraud only
     }
     long totalHits = hitsPureLegit + hitsPureFraud + hitsDom;
     Console.WriteLine($"  Fast-path coverage: {totalHits * 100.0 / total:F1}%  " +

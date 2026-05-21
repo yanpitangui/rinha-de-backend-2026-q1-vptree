@@ -33,10 +33,10 @@ public sealed class ProfileFastPath
     {
         _edges = edges;
         _table = table;
-        _pureLegitMin = Env("FP_PURE_LEGIT_MIN", 5);
-        _pureFraudMin = Env("FP_PURE_FRAUD_MIN", 10);
-        _domLegitMin  = Env("FP_DOM_LEGIT_MIN",  50);
-        _domFraudMin  = Env("FP_DOM_FRAUD_MIN",  50);
+        _pureLegitMin = Env("FP_PURE_LEGIT_MIN", 100);        // was 5 — raised to reduce FNs
+        _pureFraudMin = Env("FP_PURE_FRAUD_MIN", 20);
+        _domLegitMin  = Env("FP_DOM_LEGIT_MIN",  int.MaxValue); // disabled: 1 fraud in N legit still FNs
+        _domFraudMin  = Env("FP_DOM_FRAUD_MIN",  100);
     }
 
     private static int Env(string name, int def) =>
@@ -90,8 +90,7 @@ public sealed class ProfileFastPath
         {
             if (total >= _pureFraudMin)  return 6; // fc=5, denied
         }
-        else if (fraud == 1 && total >= _domLegitMin) return 1;
-        else if (legit == 1 && total >= _domFraudMin) return 6;
+        else if (legit == 1 && total >= _domFraudMin) return 6; // dominant fraud → deny (FP risk, not FN)
 
         return 0;
     }

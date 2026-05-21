@@ -169,6 +169,10 @@ fn workerFn(ctx: WorkerCtx) void {
             passfd(ctrl, client_fd) catch {
                 _ = linux.close(ctrl_fds[idx]);
                 ctrl_fds[idx] = -1;
+                // Retry with other API before dropping the client.
+                if (ctrl_fds[idx ^ 1] >= 0) {
+                    passfd(ctrl_fds[idx ^ 1], client_fd) catch {};
+                }
             };
             _ = linux.close(client_fd);
         }
