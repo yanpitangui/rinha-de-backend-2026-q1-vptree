@@ -44,9 +44,7 @@ foreach (var kv in mccRisk)
         mccLut[kv.Key] = DirectHandler.Q((float)kv.Value);
 FraudHandler.MccLut = mccLut;
 
-var fastPathFile = Path.Combine(resourcesPath, "fastpath.bin");
-if (File.Exists(fastPathFile))
-    FraudHandler.FastPath = ProfileFastPath.Load(fastPathFile);
+FraudHandler.FastPath = mmap.FastPath;
 
 // Warmup: prime branch predictor + CPU caches before serving
 {

@@ -45,6 +45,18 @@ public sealed class ProfileFastPath
     public static ProfileFastPath Load(string path)
     {
         using var br = new BinaryReader(File.OpenRead(path));
+        return LoadFromReader(br);
+    }
+
+    public static unsafe ProfileFastPath LoadFromPointer(byte* ptr, long length)
+    {
+        using var ms = new UnmanagedMemoryStream(ptr, length);
+        using var br = new BinaryReader(ms);
+        return LoadFromReader(br);
+    }
+
+    private static ProfileFastPath LoadFromReader(BinaryReader br)
+    {
         int magic = br.ReadInt32();
         if (magic != unchecked((int)0x46415333))
             throw new InvalidDataException($"fastpath.bin: expected magic FAS3, got 0x{magic:X8}");

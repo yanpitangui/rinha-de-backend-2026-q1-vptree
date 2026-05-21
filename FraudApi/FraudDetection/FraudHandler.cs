@@ -5,7 +5,7 @@ namespace FraudApi.FraudDetection;
 
 public static class FraudHandler
 {
-    public static VpTreeEngine Engine = default!;
+    public static SegmentedVpTreeEngine Engine = default!;
     public static Dictionary<int, double> MccRisk = default!;
     public static short[] MccLut = default!;
     public static NormalizationConfig Norm = default!;

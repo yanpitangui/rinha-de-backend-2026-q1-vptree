@@ -7,7 +7,6 @@ const int   Scale           = 10000;
 const int   Dims            = 14;
 const int   BucketSize      = 128;
 const int   VpSampleSize    = 20;         // candidates sampled per node for vantage point selection
-const int   Magic           = 0x56505454; // "VPTT"
 const short PaddingSentinel = short.MaxValue; // well outside [0,Scale] → guaranteed large distance → never enters heap
 
 var resourcesPath =
@@ -21,7 +20,7 @@ var output = Path.Combine(resourcesPath, "vptree.bin");
 
 Console.WriteLine($"Loading dataset from: {input}");
 
-// ── Phase 1: stream all vectors ───────────────────────────────────────────
+// Phase 1: stream all vectors
 const int MaxVectors = 3_100_000;
 var allVecs   = new short[MaxVectors * 16];
 var allLabels = new byte[MaxVectors];
@@ -84,7 +83,7 @@ int total = 0;
 
 Console.WriteLine($"Loaded {total} vectors. Computing dim variance...");
 
-// ── Phase 2: per-dim variance → dimOrder ─────────────────────────────────
+// Phase 2: per-dim variance → dimOrder
 var mean = new double[Dims];
 var m2   = new double[Dims];
 for (int i = 0; i < total; i++)
@@ -101,83 +100,117 @@ for (int i = 0; i < total; i++)
 var dimVariance = new double[Dims];
 for (int d = 0; d < Dims; d++) dimVariance[d] = m2[d] / total;
 var dimOrder = Enumerable.Range(0, Dims).OrderByDescending(d => dimVariance[d]).ToArray();
-Console.WriteLine($"Dim order (high→low variance): [{string.Join(", ", dimOrder)}]");
+Console.WriteLine($"Dim order (high->low variance): [{string.Join(", ", dimOrder)}]");
 
-// ── Phase 3: build VP-tree ────────────────────────────────────────────────
-Console.WriteLine("Building VP-tree...");
+// Phase 3: partition into 16 segments and build VP-trees
+// Segment key: bit3=has_last_tx, bit2=is_online, bit1=card_present, bit0=unknown_merchant
+Console.WriteLine("Partitioning into segments and building VP-trees...");
 
-var rng          = new Random(42);
-var nodes        = new List<VpNode>();
-int leafBlockCount = 0;
+var rng = new Random(42);
 
-// Leaf data buffered to streams — written after nodes in the final file
-var leafBlocksMs = new MemoryStream();
-var leafLabelsMs = new MemoryStream();
-var bwLB = new BinaryWriter(leafBlocksMs);
-var bwLL = new BinaryWriter(leafLabelsMs);
+var segIndices = new List<int>[16];
+for (int s = 0; s < 16; s++) segIndices[s] = new List<int>(total / 16 + 1);
+for (int i = 0; i < total; i++) segIndices[GetSegKey(i)].Add(i);
 
-var allIndices = new int[total];
-for (int i = 0; i < total; i++) allIndices[i] = i;
-BuildNode(allIndices);
+var segNodeLists       = new List<VpNode>[16];
+var segLeafBlockBytes  = new byte[16][];
+var segLeafLabelBytes  = new byte[16][];
+var segLeafBlockCounts = new int[16];
 
-bwLB.Flush(); bwLL.Flush();
+// Mutable state captured by BuildNode; reset per segment.
+List<VpNode>  nodes         = null!;
+int           leafBlockCount = 0;
+MemoryStream  leafBlocksMs   = null!;
+MemoryStream  leafLabelsMs   = null!;
+BinaryWriter  bwLB           = null!;
+BinaryWriter  bwLL           = null!;
 
-int nodeCount = nodes.Count;
-Console.WriteLine($"VP-tree built: {nodeCount} nodes, {leafBlockCount} leaf blocks");
-
-// ── Phase 4: write vptree.bin ─────────────────────────────────────────────
-// Layout:
-//   [4B] magic  [4B] N  [4B] nodeCount  [4B] bucketSize  [4B] leafBlockCount
-//   [14×4B] dimOrder
-//   nodes:      nodeCount × 64B (VpNode with inline VP vector)
-//   leafBlocks: leafBlockCount × sizeof(Block) (= ×224B, column-major 8-wide)
-//   leafLabels: leafBlockCount × 8B
-
-using var bw = new BinaryWriter(File.Create(output));
-bw.Write(Magic);
-bw.Write(total);
-bw.Write(nodeCount);
-bw.Write(BucketSize);
-bw.Write(leafBlockCount);
-foreach (var d in dimOrder) bw.Write(d);
-
-foreach (var nd in nodes)
+for (int s = 0; s < 16; s++)
 {
-    // Binary layout must match runtime VpNode [StructLayout(Sequential, Pack=2, Size=64)]:
-    //   int Left      @ 0  (4B)
-    //   int Right     @ 4  (4B)
-    //   float Thresh  @ 8  (4B)
-    //   byte VpLabel  @ 12 (1B)
-    //   byte Hi       @ 13 (1B)
-    //   int VpOrCnt   @ 14 (4B)  [Pack=2 → no gap after byte]
-    //   short Vp[14]  @ 18 (28B)
-    //   padding       @ 46 (18B) → total 64B
-    bw.Write(nd.Left);
-    bw.Write(nd.Right);
-    bw.Write(nd.Threshold);
-    bw.Write(nd.VpLabel);
-    bw.Write((byte)0);          // BlockCountHi (unused)
-    bw.Write(nd.VpIdxOrCount);
-    if (nd.Vp != null)
-        foreach (var v in nd.Vp) bw.Write(v);
-    else
-        for (int i = 0; i < Dims; i++) bw.Write((short)0);
-    for (int i = 0; i < 18; i++) bw.Write((byte)0); // pad to 64B
+    nodes          = new List<VpNode>();
+    leafBlockCount = 0;
+    leafBlocksMs   = new MemoryStream();
+    leafLabelsMs   = new MemoryStream();
+    bwLB           = new BinaryWriter(leafBlocksMs);
+    bwLL           = new BinaryWriter(leafLabelsMs);
+
+    BuildNode(segIndices[s].ToArray());
+    bwLB.Flush(); bwLL.Flush();
+
+    segNodeLists[s]       = nodes;
+    segLeafBlockBytes[s]  = leafBlocksMs.ToArray();
+    segLeafLabelBytes[s]  = leafLabelsMs.ToArray();
+    segLeafBlockCounts[s] = leafBlockCount;
+
+    Console.WriteLine($"  Seg {s,2}: {segIndices[s].Count,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
 }
 
-var leafBlocksBytes = leafBlocksMs.ToArray();
-var leafLabelsBytes = leafLabelsMs.ToArray();
-bw.Write(leafBlocksBytes);
-bw.Write(leafLabelsBytes);
+Console.WriteLine($"Segmented VP-trees built: {segNodeLists.Sum(l => l.Count)} total nodes, " +
+                  $"{segLeafBlockCounts.Sum()} total leaf blocks");
+
+// Phase 4: write segmented vptree.bin
+// Layout:
+//   [4B] magic 0x56505453 "VPTS"
+//   [4B] numSegments = 16
+//   [14x4B] dimOrder (56B)
+//   [16x16B] per-segment headers: [nodeCount, leafBlockCount, totalVectors, 0]  => 256B
+//   Header ends at offset 4+4+56+256 = 320.
+//   Concatenated nodes (seg 0..15), each nodeCount[s] x 64B
+//   Concatenated leafBlocks, each leafBlockCount[s] x 224B
+//   Concatenated leafLabels, each leafBlockCount[s] x 8B
+
+const int NewMagic = 0x56505453; // "VPTS"
+using var bw = new BinaryWriter(File.Create(output));
+bw.Write(NewMagic);
+bw.Write(16);
+foreach (var d in dimOrder) bw.Write(d);
+for (int s = 0; s < 16; s++)
+{
+    bw.Write(segNodeLists[s].Count);
+    bw.Write(segLeafBlockCounts[s]);
+    bw.Write(segIndices[s].Count);
+    bw.Write(0); // reserved
+}
+for (int s = 0; s < 16; s++) WriteNodes(bw, segNodeLists[s]);
+for (int s = 0; s < 16; s++) bw.Write(segLeafBlockBytes[s]);
+for (int s = 0; s < 16; s++) bw.Write(segLeafLabelBytes[s]);
+Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, before fastpath)");
+
+// Phase 5: append profile fast-path table to vptree.bin
+Console.WriteLine("Building and appending profile fast-path table...");
+BuildFastPath(allVecs, allLabels, total, bw);
 bw.Flush();
+Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, with fastpath)");
 
-Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB)");
+// Helpers
 
-// ── Phase 5: build profile fast-path table ────────────────────────────────
-Console.WriteLine("Building profile fast-path table...");
-BuildFastPath(allVecs, allLabels, total, resourcesPath);
+int GetSegKey(int vecIdx)
+{
+    int b = vecIdx * 16;
+    bool hasLastTx    = allVecs[b + 5] != (short)(-Scale);
+    bool isOnline     = allVecs[b + 9] != 0;
+    bool cardPresent  = allVecs[b + 10] != 0;
+    bool unknownMerch = allVecs[b + 11] != 0;
+    return (hasLastTx ? 8 : 0) | (isOnline ? 4 : 0) | (cardPresent ? 2 : 0) | (unknownMerch ? 1 : 0);
+}
 
-// ── VP-tree build helpers ─────────────────────────────────────────────────
+void WriteNodes(BinaryWriter w, List<VpNode> nodeList)
+{
+    foreach (var nd in nodeList)
+    {
+        w.Write(nd.Left);
+        w.Write(nd.Right);
+        w.Write(nd.Threshold);
+        w.Write(nd.VpLabel);
+        w.Write((byte)0);          // BlockCountHi (unused)
+        w.Write(nd.VpIdxOrCount);
+        if (nd.Vp != null)
+            foreach (var v in nd.Vp) w.Write(v);
+        else
+            for (int i = 0; i < Dims; i++) w.Write((short)0);
+        for (int i = 0; i < 18; i++) w.Write((byte)0); // pad to 64B
+    }
+}
 
 int BuildNode(int[] indices)
 {
@@ -192,7 +225,7 @@ int BuildNode(int[] indices)
 
         for (int bi = 0; bi < nBlocks; bi++)
         {
-            // 14 dims × 8 positions (column-major = Block layout)
+            // 14 dims x 8 positions (column-major = Block layout)
             for (int di = 0; di < Dims; di++)
                 for (int pos = 0; pos < 8; pos++)
                 {
@@ -313,7 +346,7 @@ long DistSqInt64(int aIdx, int bIdx)
     return acc;
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────
+// Shared helpers
 
 static short Quantize(double v)
 {
@@ -323,10 +356,10 @@ static short Quantize(double v)
     return (short)q;
 }
 
-static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string resourcesPath)
+static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, BinaryWriter bw)
 {
     int[] featureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
-    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=23 → 8M entries × 2B = 16 MiB
+    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=23 => 8M entries x 2B = 16 MiB
 
     int nf        = featureIndex.Length;
     int tableSize = 1 << bits.Sum();
@@ -386,17 +419,14 @@ static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string r
     Console.WriteLine($"  Fast-path coverage: {totalHits * 100.0 / total:F1}%  " +
                       $"(pure-legit={hitsPureLegit}, pure-fraud={hitsPureFraud}, dominant={hitsDom})");
 
-    var outputPath = Path.Combine(resourcesPath, "fastpath.bin");
-    using var bw2 = new BinaryWriter(File.Create(outputPath));
-    bw2.Write(unchecked((int)0x46415333));
+    bw.Write(unchecked((int)0x46415333));
     for (int f = 0; f < nf; f++)
     {
-        bw2.Write(edges[f].Length);
-        foreach (var e in edges[f]) bw2.Write(e);
+        bw.Write(edges[f].Length);
+        foreach (var e in edges[f]) bw.Write(e);
     }
-    bw2.Write(tableSize);
-    foreach (var v in table) bw2.Write(v);
-    Console.WriteLine($"  Written {outputPath} ({new FileInfo(outputPath).Length / 1024.0 / 1024.0:F1} MiB)");
+    bw.Write(tableSize);
+    foreach (var v in table) bw.Write(v);
 }
 
 static int FindBinS(short[] edges, short v)

@@ -53,7 +53,7 @@ services:
       resources:
         limits:
           cpus: "0.425"
-          memory: "160MB"
+          memory: "170MB"
 
   api2:
     build:
@@ -83,7 +83,7 @@ services:
       resources:
         limits:
           cpus: "0.425"
-          memory: "160MB"
+          memory: "170MB"
 
 volumes:
   uds-sockets:
