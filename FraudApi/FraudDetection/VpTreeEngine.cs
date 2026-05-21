@@ -40,14 +40,17 @@ public sealed unsafe class VpTreeEngine
     }
 
     [SkipLocalsInit]
-    public int Search(Span<short> query)
+    public int Search(Span<short> query, Span<float> queryFloat = default)
     {
         Span<short> q = stackalloc short[16];
         for (int di = 0; di < 14; di++) q[di] = query[_dimOrder[di]];
         q[14] = 0; q[15] = 0; // padding for 16-wide SIMD DistNorm
 
         Span<float> qf = stackalloc float[16];
-        for (int di = 0; di < 14; di++) qf[di] = q[di] * InvScale;
+        if (!queryFloat.IsEmpty)
+            for (int di = 0; di < 14; di++) qf[di] = queryFloat[_dimOrder[di]];
+        else
+            for (int di = 0; di < 14; di++) qf[di] = q[di] * InvScale;
 
         var heap = new KnnHeap5();
         fixed (short* qp = q)

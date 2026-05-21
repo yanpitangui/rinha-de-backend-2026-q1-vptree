@@ -35,6 +35,7 @@ services:
       - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
       - DOTNET_PROCESSOR_COUNT=1
       - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
+      - DOTNET_EnableDiagnostics=0
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -64,6 +65,7 @@ services:
       - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
       - DOTNET_PROCESSOR_COUNT=1
       - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
+      - DOTNET_EnableDiagnostics=0
     volumes:
       - uds-sockets:/sockets
     healthcheck:

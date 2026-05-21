@@ -326,7 +326,7 @@ static short Quantize(double v)
 static void BuildFastPath(short[] allVecs, byte[] allLabels, int total, string resourcesPath)
 {
     int[] featureIndex = [6,  2,  5, 0, 12, 7, 9, 10, 11];
-    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1];
+    int[] bits         = [6,  4,  3, 3,  2, 2, 1,  1,  1]; // sum=23 → 8M entries × 2B = 16 MiB
 
     int nf        = featureIndex.Length;
     int tableSize = 1 << bits.Sum();

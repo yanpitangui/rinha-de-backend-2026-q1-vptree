@@ -33,7 +33,8 @@ public static class DirectHandler
     internal static int ComputeIndex(ReadOnlySpan<byte> body)
     {
         Span<short> query = stackalloc short[16];
-        if (!TryVectorize(body, query, FraudHandler.MccRisk, FraudHandler.Norm))
+        Span<float> qf    = stackalloc float[16];
+        if (!TryVectorize(body, query, qf, FraudHandler.MccRisk, FraudHandler.Norm))
             return 0;
 
         if (FraudHandler.FastPath is { } fp)
@@ -42,7 +43,7 @@ public static class DirectHandler
             if (fpr != 0) return fpr - 1;
         }
 
-        return FraudHandler.Engine.Search(query);
+        return FraudHandler.Engine.Search(query, qf);
     }
 
     public static Task Handle(HttpContext ctx)
@@ -74,9 +75,10 @@ public static class DirectHandler
     private static byte[] ComputeResponse(ReadOnlySequence<byte> buffer)
     {
         Span<short> query = stackalloc short[16];
+        Span<float> qf    = stackalloc float[16];
         bool ok = buffer.IsSingleSegment
-            ? TryVectorize(buffer.FirstSpan, query, FraudHandler.MccRisk, FraudHandler.Norm)
-            : TryVectorizeMultiSeg(buffer, query, FraudHandler.MccRisk, FraudHandler.Norm);
+            ? TryVectorize(buffer.FirstSpan, query, qf, FraudHandler.MccRisk, FraudHandler.Norm)
+            : TryVectorizeMultiSeg(buffer, query, qf, FraudHandler.MccRisk, FraudHandler.Norm);
 
         if (!ok) return FraudHandler.Responses[0];
 
@@ -86,21 +88,21 @@ public static class DirectHandler
             if (fpr != 0) return FraudHandler.Responses[fpr - 1];
         }
 
-        return FraudHandler.Responses[FraudHandler.Engine.Search(query)];
+        return FraudHandler.Responses[FraudHandler.Engine.Search(query, qf)];
     }
 
-    private static bool TryVectorizeMultiSeg(ReadOnlySequence<byte> buffer, Span<short> dst,
+    private static bool TryVectorizeMultiSeg(ReadOnlySequence<byte> buffer, Span<short> dst, Span<float> fDst,
         Dictionary<int, double> mccRisk, NormalizationConfig n)
     {
         int len = (int)buffer.Length;
         var arr = ArrayPool<byte>.Shared.Rent(len);
         buffer.CopyTo(arr);
-        bool ok = TryVectorize(new ReadOnlySpan<byte>(arr, 0, len), dst, mccRisk, n);
+        bool ok = TryVectorize(new ReadOnlySpan<byte>(arr, 0, len), dst, fDst, mccRisk, n);
         ArrayPool<byte>.Shared.Return(arr);
         return ok;
     }
 
-    private static bool TryVectorize(ReadOnlySpan<byte> body, Span<short> dst,
+    private static bool TryVectorize(ReadOnlySpan<byte> body, Span<short> dst, Span<float> fDst,
         Dictionary<int, double> mccRisk, NormalizationConfig n)
     {
         var reader = new Utf8JsonReader(body);
@@ -322,6 +324,21 @@ public static class DirectHandler
 
             if (!hasLastTx) { dst[5] = (short)(-Scale); dst[6] = (short)(-Scale); }
             else            { dst[5] = (short)packed.GetElement(3); dst[6] = (short)packed.GetElement(4); }
+
+            fDst[0]  = clamped.GetElement(0);
+            fDst[1]  = clamped.GetElement(1);
+            fDst[2]  = clamped.GetElement(2);
+            fDst[3]  = hour / 23f;
+            fDst[4]  = dow / 6f;
+            fDst[5]  = hasLastTx ? clamped.GetElement(3) : -1f;
+            fDst[6]  = hasLastTx ? clamped.GetElement(4) : -1f;
+            fDst[7]  = clamped.GetElement(5);
+            fDst[8]  = clamped.GetElement(6);
+            fDst[9]  = isOnline    ? 1f : 0f;
+            fDst[10] = cardPresent ? 1f : 0f;
+            fDst[11] = knownMerchant ? 0f : 1f;
+            fDst[12] = FraudHandler.MccLut[mcc] * (1f / Scale);
+            fDst[13] = clamped.GetElement(7);
         }
         else
         {
@@ -341,6 +358,21 @@ public static class DirectHandler
             dst[7]  = Q(Clamp(kmFromHome / (float)n.MaxKm));
             dst[8]  = Q(Clamp(txCount24h / (float)n.MaxTxCount24h));
             dst[13] = Q(Clamp(merchantAvgAmount / (float)n.MaxMerchantAvgAmount));
+
+            fDst[0]  = Clamp(amount / (float)n.MaxAmount);
+            fDst[1]  = Clamp(installments / (float)n.MaxInstallments);
+            fDst[2]  = Clamp(amount / avgAmount / (float)n.AmountVsAvgRatio);
+            fDst[3]  = hour / 23f;
+            fDst[4]  = dow / 6f;
+            fDst[5]  = hasLastTx ? Clamp(MinutesDiff(lastAt, reqAt) / (float)n.MaxMinutes) : -1f;
+            fDst[6]  = hasLastTx ? Clamp(kmFromCurrent / (float)n.MaxKm) : -1f;
+            fDst[7]  = Clamp(kmFromHome / (float)n.MaxKm);
+            fDst[8]  = Clamp(txCount24h / (float)n.MaxTxCount24h);
+            fDst[9]  = isOnline    ? 1f : 0f;
+            fDst[10] = cardPresent ? 1f : 0f;
+            fDst[11] = knownMerchant ? 0f : 1f;
+            fDst[12] = FraudHandler.MccLut[mcc] * (1f / Scale);
+            fDst[13] = Clamp(merchantAvgAmount / (float)n.MaxMerchantAvgAmount);
         }
 
         return true;
