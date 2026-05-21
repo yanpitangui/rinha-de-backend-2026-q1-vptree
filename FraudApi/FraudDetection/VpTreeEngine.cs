@@ -63,29 +63,42 @@ public sealed unsafe class VpTreeEngine
     [SkipLocalsInit]
     internal void SearchInto(short* qp, float* qfp, ref KnnHeap5 heap)
     {
-        // Explicit stack -- avoids ~23 recursive call frames per query.
-        // Far side pushed first (gap^2 as minDistSq), near side second (0) -> LIFO = near first.
+        // Near child always has minDist=0 so is always visited -- skip push/pop, process directly.
+        // Only push far child, and skip push if already prunable (farMinDist > heap.Worst).
         StackEntry* stack = stackalloc StackEntry[64];
         int top = 0;
-        stack[top++] = new StackEntry(0, 0f);
+        int curNode = 0;
+        float curMin = 0f;
 
-        while (top > 0)
+        while (true)
         {
-            StackEntry e = stack[--top];
-            if (e.MinDistSq > heap.Worst) continue;
+            if (curMin > heap.Worst)
+            {
+                if (top == 0) break;
+                StackEntry e = stack[--top];
+                curNode = e.NodeIdx; curMin = e.MinDistSq;
+                continue;
+            }
 
-            VpNode* node = _nodes + e.NodeIdx;
+            VpNode* node = _nodes + curNode;
 
             if (node->Right == -1)
             {
-                // Peek at next stack entry: if leaf, prefetch its first block to overlap transfer.
+                // Peek at next stack entry: if leaf, prefetch its first blocks to overlap DRAM transfer.
                 if (top > 0)
                 {
                     VpNode* peek = _nodes + stack[top - 1].NodeIdx;
                     if (peek->Right == -1)
-                        Sse.Prefetch0(_leafBlocks + peek->Left);
+                    {
+                        int peekBlocks = Math.Min(peek->VpIdxOrCount, 5);
+                        for (int p = 0; p < peekBlocks; p++)
+                            Sse.Prefetch0(_leafBlocks + peek->Left + p);
+                    }
                 }
                 ScanLeafBlocks(qfp, node->Left, node->VpIdxOrCount, ref heap);
+                if (top == 0) break;
+                StackEntry le = stack[--top];
+                curNode = le.NodeIdx; curMin = le.MinDistSq;
                 continue;
             }
 
@@ -100,8 +113,12 @@ public sealed unsafe class VpTreeEngine
 
             Sse.Prefetch0(_nodes + near);
 
-            stack[top++] = new StackEntry(far,  gap * gap);
-            stack[top++] = new StackEntry(near, 0f);
+            float farMinDist = gap * gap;
+            if (farMinDist <= heap.Worst)
+                stack[top++] = new StackEntry(far, farMinDist);
+
+            curNode = near;
+            curMin = 0f;
         }
     }
 
@@ -111,17 +128,21 @@ public sealed unsafe class VpTreeEngine
         float* dptr    = stackalloc float[8];
         float  boundSq = heap.Worst;
 
-        int prefetchLimit = Math.Min(blockCount, 4);
+        int prefetchLimit = Math.Min(blockCount, 8);
         for (int p = 0; p < prefetchLimit; p++)
             Sse.Prefetch0(_leafBlocks + blockStart + p);
 
         for (int bi = 0; bi < blockCount; bi++)
         {
-            if (bi + 3 < blockCount)
-                Sse.Prefetch0(_leafBlocks + blockStart + bi + 3);
+            if (bi + 7 < blockCount)
+                Sse.Prefetch0(_leafBlocks + blockStart + bi + 7);
 
             Block* block = _leafBlocks + blockStart + bi;
             if (!ProcessBlock(block, qf, dptr, boundSq)) continue;
+
+            // Skip heap update if dims 12-13 pushed all final distances over bound.
+            if (Avx.MoveMask(Avx.CompareLessThan(Avx.LoadVector256(dptr), Vector256.Create(boundSq))) == 0)
+                continue;
 
             byte* labels = _leafLabels + ((long)(blockStart + bi) << 3);
             for (int i = 0; i < 8; i++)
@@ -144,6 +165,7 @@ public sealed unsafe class VpTreeEngine
         {
             var scale = Vector256.Create(InvScale);
             var acc   = Vector256<float>.Zero;
+            var bound = Vector256.Create(boundSq);
 
             for (int di = 0; di < 14; di++)
             {
@@ -156,11 +178,8 @@ public sealed unsafe class VpTreeEngine
                     : Avx.Add(acc, Avx.Multiply(dif, dif));
 
                 // Every 2 dims: partial sum is a valid lower bound -- reject block early.
-                if ((di & 1) == 1 && di < 13 && boundSq < float.MaxValue)
-                {
-                    if (Avx.MoveMask(Avx.CompareLessThan(acc, Vector256.Create(boundSq))) == 0)
-                        return false;
-                }
+                if ((di & 1) == 1 && di < 13 && Avx.MoveMask(Avx.CompareLessThan(acc, bound)) == 0)
+                    return false;
             }
 
             Avx.Store(dptr, acc);

@@ -46,14 +46,29 @@ FraudHandler.MccLut = mccLut;
 
 FraudHandler.FastPath = mmap.FastPath;
 
-// Warmup: prime branch predictor + CPU caches before serving
+// Warmup: prime branch predictor + CPU caches for all 16 segments before serving.
+// Original 200-query loop only hit segs 8-15 (dim5 always >=0 → has_last_tx=true).
+// Segs 0-7 (no last_tx, dim5=dim6=-10000) were completely cold.
 {
     var rng = new Random(42);
     Span<short> q = stackalloc short[16];
-    for (int i = 0; i < 200; i++)
+    const int WarmupPerSeg = 50;
+    for (int seg = 0; seg < 16; seg++)
     {
-        for (int d = 0; d < 14; d++) q[d] = (short)rng.Next(0, 10001);
-        FraudHandler.Engine.Search(q);
+        bool hasLastTx    = (seg & 8) != 0;
+        bool isOnline     = (seg & 4) != 0;
+        bool cardPresent  = (seg & 2) != 0;
+        bool unknownMerch = (seg & 1) != 0;
+        for (int i = 0; i < WarmupPerSeg; i++)
+        {
+            for (int d = 0; d < 14; d++) q[d] = (short)rng.Next(0, 10001);
+            q[5]  = hasLastTx    ? (short)rng.Next(0, 10001) : (short)(-10000);
+            q[6]  = hasLastTx    ? (short)rng.Next(0, 10001) : (short)(-10000);
+            q[9]  = isOnline     ? (short)10000 : (short)0;
+            q[10] = cardPresent  ? (short)10000 : (short)0;
+            q[11] = unknownMerch ? (short)10000 : (short)0;
+            FraudHandler.Engine.Search(q);
+        }
     }
 }
 

@@ -5,7 +5,7 @@ using FraudApi.Shared;
 
 const int   Scale           = 10000;
 const int   Dims            = 14;
-const int   BucketSize      = 128;
+const int   BucketSize      = 1024;
 const int   VpSampleSize    = 20;         // candidates sampled per node for vantage point selection
 const short PaddingSentinel = short.MaxValue; // well outside [0,Scale] → guaranteed large distance → never enters heap
 
@@ -211,6 +211,7 @@ void WriteNodes(BinaryWriter w, List<VpNode> nodeList)
         for (int i = 0; i < 18; i++) w.Write((byte)0); // pad to 64B
     }
 }
+
 
 int BuildNode(int[] indices)
 {
