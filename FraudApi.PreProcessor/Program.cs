@@ -5,8 +5,8 @@ using FraudApi.Shared;
 
 const int   Scale           = 10000;
 const int   Dims            = 14;
-const int   BucketSize      = 1024;
-const int   VpSampleSize    = 20;         // candidates sampled per node for vantage point selection
+int         BucketSize      = int.TryParse(Environment.GetEnvironmentVariable("BUCKET_SIZE"), out var bs) ? bs : 1024;
+int         VpSampleSize    = int.TryParse(Environment.GetEnvironmentVariable("VP_SAMPLE_SIZE"), out var vps) ? vps : 20;
 const short PaddingSentinel = short.MaxValue; // well outside [0,Scale] → guaranteed large distance → never enters heap
 
 var resourcesPath =
