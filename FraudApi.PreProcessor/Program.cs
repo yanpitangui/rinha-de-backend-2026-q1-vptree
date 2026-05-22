@@ -112,10 +112,10 @@ var segIndices = new List<int>[16];
 for (int s = 0; s < 16; s++) segIndices[s] = new List<int>(total / 16 + 1);
 for (int i = 0; i < total; i++) segIndices[GetSegKey(i)].Add(i);
 
-var segNodeLists       = new List<VpNode>[16];
-var segLeafBlockBytes  = new byte[16][];
-var segLeafLabelBytes  = new byte[16][];
-var segLeafBlockCounts = new int[16];
+var segNodeLists       = new List<VpNode>[17]; // 16 base + seg 16 = Seg10 hi split
+var segLeafBlockBytes  = new byte[17][];
+var segLeafLabelBytes  = new byte[17][];
+var segLeafBlockCounts = new int[17];
 
 // Mutable state captured by BuildNode; reset per segment.
 List<VpNode>  nodes         = null!;
@@ -134,7 +134,8 @@ for (int s = 0; s < 16; s++)
     bwLB           = new BinaryWriter(leafBlocksMs);
     bwLL           = new BinaryWriter(leafLabelsMs);
 
-    BuildNode(segIndices[s].ToArray());
+    if (s != 10) // Seg 10 rebuilt below as lo/hi split
+        BuildNode(segIndices[s].ToArray());
     bwLB.Flush(); bwLL.Flush();
 
     segNodeLists[s]       = nodes;
@@ -142,38 +143,71 @@ for (int s = 0; s < 16; s++)
     segLeafLabelBytes[s]  = leafLabelsMs.ToArray();
     segLeafBlockCounts[s] = leafBlockCount;
 
-    Console.WriteLine($"  Seg {s,2}: {segIndices[s].Count,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
+    if (s != 10)
+        Console.WriteLine($"  Seg {s,2}: {segIndices[s].Count,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
 }
 
-Console.WriteLine($"Segmented VP-trees built: {segNodeLists.Sum(l => l.Count)} total nodes, " +
+// Split Seg 10 (largest segment) by highest-variance dim for better cross-seg pruning.
+int seg10SplitDim       = FindBestSplitDim(segIndices[10]);
+short seg10SplitThresh  = ComputeMedianForDim(segIndices[10], seg10SplitDim);
+var seg10LoArr = segIndices[10].Where(idx => allVecs[idx * 16 + seg10SplitDim] <= seg10SplitThresh).ToArray();
+var seg10HiArr = segIndices[10].Where(idx => allVecs[idx * 16 + seg10SplitDim] >  seg10SplitThresh).ToArray();
+Console.WriteLine($"  Seg 10 split: dim {seg10SplitDim}, threshold {seg10SplitThresh}, lo={seg10LoArr.Length}, hi={seg10HiArr.Length}");
+
+nodes = new List<VpNode>(); leafBlockCount = 0;
+leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
+bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
+BuildNode(seg10LoArr); bwLB.Flush(); bwLL.Flush();
+segNodeLists[10] = nodes; segLeafBlockBytes[10] = leafBlocksMs.ToArray();
+segLeafLabelBytes[10] = leafLabelsMs.ToArray(); segLeafBlockCounts[10] = leafBlockCount;
+Console.WriteLine($"  Seg 10lo: {seg10LoArr.Length,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
+
+nodes = new List<VpNode>(); leafBlockCount = 0;
+leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
+bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
+BuildNode(seg10HiArr); bwLB.Flush(); bwLL.Flush();
+segNodeLists[16] = nodes; segLeafBlockBytes[16] = leafBlocksMs.ToArray();
+segLeafLabelBytes[16] = leafLabelsMs.ToArray(); segLeafBlockCounts[16] = leafBlockCount;
+Console.WriteLine($"  Seg 10hi: {seg10HiArr.Length,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
+
+Console.WriteLine($"Segmented VP-trees built (17 segs): {segNodeLists.Where(n => n != null).Sum(l => l!.Count)} total nodes, " +
                   $"{segLeafBlockCounts.Sum()} total leaf blocks");
 
 // Phase 4: write segmented vptree.bin
-// Layout:
+// Layout (17-seg format):
 //   [4B] magic 0x56505453 "VPTS"
-//   [4B] numSegments = 16
+//   [4B] numSegments = 17
 //   [14x4B] dimOrder (56B)
-//   [16x16B] per-segment headers: [nodeCount, leafBlockCount, totalVectors, 0]  => 256B
-//   Header ends at offset 4+4+56+256 = 320.
-//   Concatenated nodes (seg 0..15), each nodeCount[s] x 64B
+//   [17x16B] per-segment headers: [nodeCount, leafBlockCount, totalVectors, 0] => 272B
+//   [4B] seg10SplitDim
+//   [4B] seg10SplitThreshold (stored as int)
+//   Header ends at offset 4+4+56+272+8 = 344B.
+//   Concatenated nodes (seg 0..16), each nodeCount[s] x 64B
 //   Concatenated leafBlocks, each leafBlockCount[s] x 224B
 //   Concatenated leafLabels, each leafBlockCount[s] x 8B
+
+var segTotalVectors = new int[17];
+for (int s = 0; s < 16; s++) segTotalVectors[s] = segIndices[s].Count;
+segTotalVectors[10] = seg10LoArr.Length;
+segTotalVectors[16] = seg10HiArr.Length;
 
 const int NewMagic = 0x56505453; // "VPTS"
 using var bw = new BinaryWriter(File.Create(output));
 bw.Write(NewMagic);
-bw.Write(16);
+bw.Write(17);
 foreach (var d in dimOrder) bw.Write(d);
-for (int s = 0; s < 16; s++)
+for (int s = 0; s < 17; s++)
 {
-    bw.Write(segNodeLists[s].Count);
+    bw.Write(segNodeLists[s]!.Count);
     bw.Write(segLeafBlockCounts[s]);
-    bw.Write(segIndices[s].Count);
+    bw.Write(segTotalVectors[s]);
     bw.Write(0); // reserved
 }
-for (int s = 0; s < 16; s++) WriteNodes(bw, segNodeLists[s]);
-for (int s = 0; s < 16; s++) bw.Write(segLeafBlockBytes[s]);
-for (int s = 0; s < 16; s++) bw.Write(segLeafLabelBytes[s]);
+bw.Write(seg10SplitDim);
+bw.Write((int)seg10SplitThresh);
+for (int s = 0; s < 17; s++) WriteNodes(bw, segNodeLists[s]!);
+for (int s = 0; s < 17; s++) bw.Write(segLeafBlockBytes[s]!);
+for (int s = 0; s < 17; s++) bw.Write(segLeafLabelBytes[s]!);
 Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, before fastpath)");
 
 // Phase 5: append profile fast-path table to vptree.bin
@@ -348,6 +382,27 @@ long DistSqInt64(int aIdx, int bIdx)
 }
 
 // Shared helpers
+
+int FindBestSplitDim(List<int> indices)
+{
+    double bestVar = -1; int bestDim = 0;
+    for (int d = 0; d < Dims; d++)
+    {
+        if (d is 5 or 6 or 9 or 10 or 11) continue; // skip seg-key dims
+        double sum = 0, sum2 = 0, n = indices.Count;
+        foreach (var idx in indices) { double v = allVecs[idx * 16 + d]; sum += v; sum2 += v * v; }
+        double variance = sum2 / n - (sum / n) * (sum / n);
+        if (variance > bestVar) { bestVar = variance; bestDim = d; }
+    }
+    return bestDim;
+}
+
+short ComputeMedianForDim(List<int> indices, int dim)
+{
+    var vals = indices.Select(idx => allVecs[idx * 16 + dim]).ToArray();
+    Array.Sort(vals);
+    return vals[vals.Length / 2];
+}
 
 static short Quantize(double v)
 {

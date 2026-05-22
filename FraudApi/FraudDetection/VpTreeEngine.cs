@@ -220,12 +220,26 @@ public sealed unsafe class SegmentedVpTreeEngine
     // _sortedNeighbors[s*15 .. s*15+14]: other segment indices sorted by ascending cross-dist[s,*]
     private readonly byte[]         _sortedNeighbors;
     private static readonly float[] s_crossDist = BuildCrossDistTable();
+    // Seg 10 continuous split: reordered dim index and int16 threshold. -1 = no split.
+    private readonly int   _splitDimReordered;
+    private readonly short _splitThreshold;
 
-    public SegmentedVpTreeEngine(VpTreeEngine[] segs, int[] dimOrder)
+    public SegmentedVpTreeEngine(VpTreeEngine[] segs, int[] dimOrder, int splitDim = -1, short splitThreshold = 0)
     {
         _segs            = segs;
         _dimOrder        = dimOrder;
         _sortedNeighbors = BuildSortedNeighbors();
+        if (splitDim >= 0 && segs.Length == 17)
+        {
+            var rev = new int[14];
+            for (int di = 0; di < 14; di++) rev[dimOrder[di]] = di;
+            _splitDimReordered = rev[splitDim];
+            _splitThreshold    = splitThreshold;
+        }
+        else
+        {
+            _splitDimReordered = -1;
+        }
     }
 
     private static float[] BuildCrossDistTable()
@@ -298,7 +312,20 @@ public sealed unsafe class SegmentedVpTreeEngine
         fixed (short* qp = q)
         fixed (float* qfp = qf)
         {
-            _segs[segKey].SearchInto(qp, qfp, ref heap);
+            bool isSeg10 = segKey == 10 && _splitDimReordered >= 0;
+            int  ownSeg  = segKey;
+            if (isSeg10)
+                ownSeg = qp[_splitDimReordered] > _splitThreshold ? 16 : 10;
+
+            _segs[ownSeg].SearchInto(qp, qfp, ref heap);
+
+            if (isSeg10)
+            {
+                int   otherSeg = ownSeg == 10 ? 16 : 10;
+                float gap      = MathF.Abs((float)(qp[_splitDimReordered] - _splitThreshold)) * VpTreeEngine.InvScale;
+                if (heap.Worst > gap * gap)
+                    _segs[otherSeg].SearchInto(qp, qfp, ref heap);
+            }
 
             // Check other segments in ascending cross-dist order.
             // heap.Worst only decreases; cross-dist only increases along sorted list -> safe early break.
@@ -307,7 +334,16 @@ public sealed unsafe class SegmentedVpTreeEngine
             {
                 int s = _sortedNeighbors[sortBase + i];
                 if (heap.Worst <= s_crossDist[segKey * 16 + s]) break;
-                _segs[s].SearchInto(qp, qfp, ref heap);
+                if (s == 10 && _splitDimReordered >= 0)
+                {
+                    // Seg 10 is split; from outside both halves share the same external cross-dist.
+                    _segs[10].SearchInto(qp, qfp, ref heap);
+                    _segs[16].SearchInto(qp, qfp, ref heap);
+                }
+                else
+                {
+                    _segs[s].SearchInto(qp, qfp, ref heap);
+                }
             }
         }
         return heap.FraudCount;
