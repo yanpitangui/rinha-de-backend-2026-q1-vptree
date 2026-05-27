@@ -1,9 +1,4 @@
-ARG BUCKET_SIZE=1024
-ARG VP_SAMPLE_SIZE=20
-
 FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/sdk:11.0-preview-alpine AS builder
-ARG BUCKET_SIZE=1024
-ARG VP_SAMPLE_SIZE=20
 RUN apk add --no-cache clang zlib-dev musl-dev
 WORKDIR /src
 
@@ -20,7 +15,7 @@ RUN dotnet publish FraudApi.PreProcessor/FraudApi.PreProcessor.csproj -c Release
 
 # Resources — cached unless resources change (references.json.gz is the heavy input)
 COPY resources/ resources/
-RUN BUCKET_SIZE=${BUCKET_SIZE} VP_SAMPLE_SIZE=${VP_SAMPLE_SIZE} /app/preprocessor/FraudApi.PreProcessor /src/resources
+RUN /app/preprocessor/FraudApi.PreProcessor /src/resources
 
 # API source — only this layer reruns on API code changes
 COPY FraudApi/ FraudApi/

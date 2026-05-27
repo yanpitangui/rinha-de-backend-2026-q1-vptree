@@ -13,8 +13,8 @@ namespace FraudApi.Data;
 //   [N×16B]   per-seg headers: [nodeCount(4), leafBlockCount(4), totalVectors(4), reserved(4)]
 //   [8B]      (numSegments=17 only) seg10SplitDim(4) + seg10SplitThreshold(4)
 //   Nodes:      seg0..N-1 concatenated, nodeCount[s] × 64B each
-//   LeafBlocks: seg0..N-1 concatenated, leafBlockCount[s] × 224B each
-//   LeafLabels: seg0..N-1 concatenated, leafBlockCount[s] × 8B each
+//   LeafBlocks: seg0..N-1 concatenated, leafBlockCount[s] × 448B each
+//   LeafLabels: seg0..N-1 concatenated, leafBlockCount[s] × 16B each
 //   FastPath:   appended, starts with magic 0x46415333
 public sealed unsafe class MmapData
 {
@@ -79,7 +79,7 @@ public sealed unsafe class MmapData
         long curr = hdrSize;
         for (int s = 0; s < numSegs; s++) curr += (long)nodeCounts[s] * 64;
         for (int s = 0; s < numSegs; s++) curr += (long)leafBlockCounts[s] * sizeof(Block);
-        for (int s = 0; s < numSegs; s++) curr += (long)leafBlockCounts[s] * 8;
+        for (int s = 0; s < numSegs; s++) curr += (long)leafBlockCounts[s] * 16;
         long fastpathOffset = curr;
 
         // Allocate pinned array for VP-tree data only (excludes fastpath section).
@@ -119,7 +119,7 @@ public sealed unsafe class MmapData
             for (int s = 0; s < numSegs; s++) { leafBlockOffsets[s] = curr; curr += (long)leafBlockCounts[s] * sizeof(Block); }
 
             var leafLabelOffsets = new long[numSegs];
-            for (int s = 0; s < numSegs; s++) { leafLabelOffsets[s] = curr; curr += (long)leafBlockCounts[s] * 8; }
+            for (int s = 0; s < numSegs; s++) { leafLabelOffsets[s] = curr; curr += (long)leafBlockCounts[s] * 16; }
 
             var segs = new VpTreeEngine[numSegs];
             for (int s = 0; s < numSegs; s++)

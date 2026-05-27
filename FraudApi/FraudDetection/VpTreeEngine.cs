@@ -125,7 +125,7 @@ public sealed unsafe class VpTreeEngine
     [SkipLocalsInit]
     private void ScanLeafBlocks(float* qf, int blockStart, int blockCount, ref KnnHeap5 heap)
     {
-        float* dptr    = stackalloc float[8];
+        float* dptr    = stackalloc float[16];
         float  boundSq = heap.Worst;
 
         int prefetchLimit = Math.Min(blockCount, 8);
@@ -140,12 +140,14 @@ public sealed unsafe class VpTreeEngine
             Block* block = _leafBlocks + blockStart + bi;
             if (!ProcessBlock(block, qf, dptr, boundSq)) continue;
 
-            // Skip heap update if dims 12-13 pushed all final distances over bound.
-            if (Avx.MoveMask(Avx.CompareLessThan(Avx.LoadVector256(dptr), Vector256.Create(boundSq))) == 0)
+            // Skip heap update if all 16 final distances over bound.
+            var bound256 = Vector256.Create(boundSq);
+            if (Avx.MoveMask(Avx.CompareLessThan(Avx.LoadVector256(dptr),     bound256)) == 0 &&
+                Avx.MoveMask(Avx.CompareLessThan(Avx.LoadVector256(dptr + 8), bound256)) == 0)
                 continue;
 
-            byte* labels = _leafLabels + ((long)(blockStart + bi) << 3);
-            for (int i = 0; i < 8; i++)
+            byte* labels = _leafLabels + ((long)(blockStart + bi) << 4);
+            for (int i = 0; i < 16; i++)
             {
                 float dsq = dptr[i];
                 if (dsq >= boundSq) continue;
@@ -163,35 +165,45 @@ public sealed unsafe class VpTreeEngine
 
         if (Avx2.IsSupported)
         {
-            var scale = Vector256.Create(InvScale);
-            var acc   = Vector256<float>.Zero;
-            var bound = Vector256.Create(boundSq);
+            var scale  = Vector256.Create(InvScale);
+            var acc_lo = Vector256<float>.Zero;
+            var acc_hi = Vector256<float>.Zero;
+            var bound  = Vector256.Create(boundSq);
 
             for (int di = 0; di < 14; di++)
             {
-                var qv  = Vector256.Create(qf[di]);
-                var v8  = Vector128.Load(blockBase + di * 8);
-                var vf  = Avx.Multiply(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(v8)), scale);
-                var dif = Avx.Subtract(vf, qv);
-                acc = Fma.IsSupported
-                    ? Fma.MultiplyAdd(dif, dif, acc)
-                    : Avx.Add(acc, Avx.Multiply(dif, dif));
+                var qv    = Vector256.Create(qf[di]);
+                var v_lo  = Vector128.Load(blockBase + di * 16);
+                var v_hi  = Vector128.Load(blockBase + di * 16 + 8);
+                var vf_lo = Avx.Multiply(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(v_lo)), scale);
+                var vf_hi = Avx.Multiply(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(v_hi)), scale);
+                var d_lo  = Avx.Subtract(vf_lo, qv);
+                var d_hi  = Avx.Subtract(vf_hi, qv);
+                acc_lo = Fma.IsSupported
+                    ? Fma.MultiplyAdd(d_lo, d_lo, acc_lo)
+                    : Avx.Add(acc_lo, Avx.Multiply(d_lo, d_lo));
+                acc_hi = Fma.IsSupported
+                    ? Fma.MultiplyAdd(d_hi, d_hi, acc_hi)
+                    : Avx.Add(acc_hi, Avx.Multiply(d_hi, d_hi));
 
                 // Every 2 dims: partial sum is a valid lower bound -- reject block early.
-                if ((di & 1) == 1 && di < 13 && Avx.MoveMask(Avx.CompareLessThan(acc, bound)) == 0)
+                if ((di & 1) == 1 && di < 13 &&
+                    Avx.MoveMask(Avx.CompareLessThan(acc_lo, bound)) == 0 &&
+                    Avx.MoveMask(Avx.CompareLessThan(acc_hi, bound)) == 0)
                     return false;
             }
 
-            Avx.Store(dptr, acc);
+            Avx.Store(dptr,     acc_lo);
+            Avx.Store(dptr + 8, acc_hi);
             return true;
         }
 
-        for (int i = 0; i < 8; i++) dptr[i] = 0f;
+        for (int i = 0; i < 16; i++) dptr[i] = 0f;
         for (int di = 0; di < 14; di++)
         {
             float  qd = qf[di];
-            short* dd = blockBase + di * 8;
-            for (int i = 0; i < 8; i++) { float d = dd[i] * InvScale - qd; dptr[i] += d * d; }
+            short* dd = blockBase + di * 16;
+            for (int i = 0; i < 16; i++) { float d = dd[i] * InvScale - qd; dptr[i] += d * d; }
         }
         return true;
     }

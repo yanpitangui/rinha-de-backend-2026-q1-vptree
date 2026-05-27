@@ -29,9 +29,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        - BUCKET_SIZE=${BUCKET_SIZE:-1024}
-        - VP_SAMPLE_SIZE=${VP_SAMPLE_SIZE:-20}
     hostname: api1
     cpuset: "0,1"
     environment:
@@ -62,9 +59,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        - BUCKET_SIZE=${BUCKET_SIZE:-1024}
-        - VP_SAMPLE_SIZE=${VP_SAMPLE_SIZE:-20}
     hostname: api2
     cpuset: "2,3"
     environment:

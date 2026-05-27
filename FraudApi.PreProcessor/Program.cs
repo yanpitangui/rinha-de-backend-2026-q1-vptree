@@ -256,24 +256,24 @@ int BuildNode(int[] indices)
     {
         // Leaf: pack into column-major Block(s) of 8
         int blockStart = leafBlockCount;
-        int nBlocks    = (indices.Length + 7) / 8;
+        int nBlocks    = (indices.Length + 15) / 16;
 
         for (int bi = 0; bi < nBlocks; bi++)
         {
-            // 14 dims x 8 positions (column-major = Block layout)
+            // 14 dims x 16 positions (column-major = Block layout)
             for (int di = 0; di < Dims; di++)
-                for (int pos = 0; pos < 8; pos++)
+                for (int pos = 0; pos < 16; pos++)
                 {
-                    int mi = bi * 8 + pos;
+                    int mi = bi * 16 + pos;
                     short v = mi < indices.Length
                         ? allVecs[indices[mi] * 16 + dimOrder[di]]
                         : PaddingSentinel;
                     bwLB.Write(v);
                 }
-            // Labels for this block's 8 slots
-            for (int pos = 0; pos < 8; pos++)
+            // Labels for this block's 16 slots
+            for (int pos = 0; pos < 16; pos++)
             {
-                int mi = bi * 8 + pos;
+                int mi = bi * 16 + pos;
                 bwLL.Write(mi < indices.Length ? allLabels[indices[mi]] : (byte)0);
             }
         }
@@ -301,21 +301,21 @@ int BuildNode(int[] indices)
     {
         // Degenerate: fall back to leaf with all including VP
         int blockStart = leafBlockCount;
-        int nBlocks    = (indices.Length + 7) / 8;
+        int nBlocks    = (indices.Length + 15) / 16;
         for (int bi = 0; bi < nBlocks; bi++)
         {
             for (int di = 0; di < Dims; di++)
-                for (int pos = 0; pos < 8; pos++)
+                for (int pos = 0; pos < 16; pos++)
                 {
-                    int mi = bi * 8 + pos;
+                    int mi = bi * 16 + pos;
                     short v = mi < indices.Length
                         ? allVecs[indices[mi] * 16 + dimOrder[di]]
                         : PaddingSentinel;
                     bwLB.Write(v);
                 }
-            for (int pos = 0; pos < 8; pos++)
+            for (int pos = 0; pos < 16; pos++)
             {
-                int mi = bi * 8 + pos;
+                int mi = bi * 16 + pos;
                 bwLL.Write(mi < indices.Length ? allLabels[indices[mi]] : (byte)0);
             }
         }
