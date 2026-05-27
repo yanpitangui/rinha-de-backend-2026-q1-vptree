@@ -8,19 +8,21 @@ COPY FraudApi.PreProcessor/FraudApi.PreProcessor.csproj FraudApi.PreProcessor/
 COPY FraudApi/FraudApi.csproj FraudApi/
 RUN dotnet restore FraudApi/FraudApi.csproj -r linux-musl-x64
 
-# Preprocessor source — cached unless preprocessor code changes
+# Preprocessor + API source — cached unless source changes
 COPY FraudApi.Shared/ FraudApi.Shared/
 COPY FraudApi.PreProcessor/ FraudApi.PreProcessor/
 RUN dotnet publish FraudApi.PreProcessor/FraudApi.PreProcessor.csproj -c Release -o /app/preprocessor
 
-# Resources — cached unless resources change (references.json.gz is the heavy input)
-COPY resources/ resources/
-RUN /app/preprocessor/FraudApi.PreProcessor /src/resources
-
-# API source — only this layer reruns on API code changes
+# API AOT build — cached independently of resources/bucket size
 COPY FraudApi/ FraudApi/
 WORKDIR /src/FraudApi
 RUN dotnet publish FraudApi.csproj -c Release -r linux-musl-x64 -o /app/publish /p:PublishAot=true
+
+# Resources — only invalidated when resources or BUCKET_SIZE change
+WORKDIR /src
+ARG BUCKET_SIZE=2048
+COPY resources/ resources/
+RUN BUCKET_SIZE=$BUCKET_SIZE /app/preprocessor/FraudApi.PreProcessor /src/resources
 
 FROM --platform=linux/amd64 alpine:3.21
 WORKDIR /appa
