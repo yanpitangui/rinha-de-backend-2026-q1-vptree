@@ -102,8 +102,9 @@ for (int d = 0; d < Dims; d++) dimVariance[d] = m2[d] / total;
 var dimOrder = Enumerable.Range(0, Dims).OrderByDescending(d => dimVariance[d]).ToArray();
 Console.WriteLine($"Dim order (high->low variance): [{string.Join(", ", dimOrder)}]");
 
-// Phase 3: partition into 16 segments and build VP-trees
+// Phase 3: partition into 16 segments, split each by highest-variance continuous dim → 32 segs.
 // Segment key: bit3=has_last_tx, bit2=is_online, bit1=card_present, bit0=unknown_merchant
+// Seg layout: seg s = lo half of base seg s, seg 16+s = hi half of base seg s.
 Console.WriteLine("Partitioning into segments and building VP-trees...");
 
 var rng = new Random(42);
@@ -112,10 +113,14 @@ var segIndices = new List<int>[16];
 for (int s = 0; s < 16; s++) segIndices[s] = new List<int>(total / 16 + 1);
 for (int i = 0; i < total; i++) segIndices[GetSegKey(i)].Add(i);
 
-var segNodeLists       = new List<VpNode>[17]; // 16 base + seg 16 = Seg10 hi split
-var segLeafBlockBytes  = new byte[17][];
-var segLeafLabelBytes  = new byte[17][];
-var segLeafBlockCounts = new int[17];
+// 32 sub-segs + per-base split specs
+var segNodeLists       = new List<VpNode>[32];
+var segLeafBlockBytes  = new byte[32][];
+var segLeafLabelBytes  = new byte[32][];
+var segLeafBlockCounts = new int[32];
+var segTotalVectors    = new int[32];
+var splitDims          = new int[16];
+var splitThreshs       = new short[16];
 
 // Mutable state captured by BuildNode; reset per segment.
 List<VpNode>  nodes         = null!;
@@ -127,88 +132,77 @@ BinaryWriter  bwLL           = null!;
 
 for (int s = 0; s < 16; s++)
 {
-    nodes          = new List<VpNode>();
-    leafBlockCount = 0;
-    leafBlocksMs   = new MemoryStream();
-    leafLabelsMs   = new MemoryStream();
-    bwLB           = new BinaryWriter(leafBlocksMs);
-    bwLL           = new BinaryWriter(leafLabelsMs);
+    var baseList = segIndices[s];
+    if (baseList.Count > 1)
+    {
+        splitDims[s]    = FindBestSplitDim(baseList);
+        splitThreshs[s] = ComputeMedianForDim(baseList, splitDims[s]);
+    }
+    // else: dummy split (dim 0, thresh 0) — all go to lo
 
-    if (s != 10) // Seg 10 rebuilt below as lo/hi split
-        BuildNode(segIndices[s].ToArray());
-    bwLB.Flush(); bwLL.Flush();
+    var loArr = baseList.Count > 0
+        ? baseList.Where(idx => allVecs[idx * 16 + splitDims[s]] <= splitThreshs[s]).ToArray()
+        : Array.Empty<int>();
+    var hiArr = baseList.Count > 0
+        ? baseList.Where(idx => allVecs[idx * 16 + splitDims[s]] >  splitThreshs[s]).ToArray()
+        : Array.Empty<int>();
 
-    segNodeLists[s]       = nodes;
-    segLeafBlockBytes[s]  = leafBlocksMs.ToArray();
-    segLeafLabelBytes[s]  = leafLabelsMs.ToArray();
-    segLeafBlockCounts[s] = leafBlockCount;
+    void BuildSeg(int idx, int[] arr)
+    {
+        nodes = new List<VpNode>(); leafBlockCount = 0;
+        leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
+        bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
+        BuildNode(arr);
+        bwLB.Flush(); bwLL.Flush();
+        segNodeLists[idx]       = nodes;
+        segLeafBlockBytes[idx]  = leafBlocksMs.ToArray();
+        segLeafLabelBytes[idx]  = leafLabelsMs.ToArray();
+        segLeafBlockCounts[idx] = leafBlockCount;
+        segTotalVectors[idx]    = arr.Length;
+    }
 
-    if (s != 10)
-        Console.WriteLine($"  Seg {s,2}: {segIndices[s].Count,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
+    BuildSeg(s,      loArr);
+    BuildSeg(16 + s, hiArr);
+
+    Console.WriteLine($"  Seg {s,2}: {baseList.Count,7} → lo={loArr.Length,7}, hi={hiArr.Length,7}  splitDim={splitDims[s]}, thresh={splitThreshs[s]}");
 }
 
-// Split Seg 10 (largest segment) by highest-variance dim for better cross-seg pruning.
-int seg10SplitDim       = FindBestSplitDim(segIndices[10]);
-short seg10SplitThresh  = ComputeMedianForDim(segIndices[10], seg10SplitDim);
-var seg10LoArr = segIndices[10].Where(idx => allVecs[idx * 16 + seg10SplitDim] <= seg10SplitThresh).ToArray();
-var seg10HiArr = segIndices[10].Where(idx => allVecs[idx * 16 + seg10SplitDim] >  seg10SplitThresh).ToArray();
-Console.WriteLine($"  Seg 10 split: dim {seg10SplitDim}, threshold {seg10SplitThresh}, lo={seg10LoArr.Length}, hi={seg10HiArr.Length}");
-
-nodes = new List<VpNode>(); leafBlockCount = 0;
-leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
-bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
-BuildNode(seg10LoArr); bwLB.Flush(); bwLL.Flush();
-segNodeLists[10] = nodes; segLeafBlockBytes[10] = leafBlocksMs.ToArray();
-segLeafLabelBytes[10] = leafLabelsMs.ToArray(); segLeafBlockCounts[10] = leafBlockCount;
-Console.WriteLine($"  Seg 10lo: {seg10LoArr.Length,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
-
-nodes = new List<VpNode>(); leafBlockCount = 0;
-leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
-bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
-BuildNode(seg10HiArr); bwLB.Flush(); bwLL.Flush();
-segNodeLists[16] = nodes; segLeafBlockBytes[16] = leafBlocksMs.ToArray();
-segLeafLabelBytes[16] = leafLabelsMs.ToArray(); segLeafBlockCounts[16] = leafBlockCount;
-Console.WriteLine($"  Seg 10hi: {seg10HiArr.Length,7} vecs, {nodes.Count,6} nodes, {leafBlockCount,5} leaf blocks");
-
-Console.WriteLine($"Segmented VP-trees built (17 segs): {segNodeLists.Where(n => n != null).Sum(l => l!.Count)} total nodes, " +
+Console.WriteLine($"Segmented VP-trees built (32 segs): {segNodeLists.Sum(l => l!.Count)} total nodes, " +
                   $"{segLeafBlockCounts.Sum()} total leaf blocks");
 
 // Phase 4: write segmented vptree.bin
-// Layout (17-seg format):
-//   [4B] magic 0x56505453 "VPTS"
-//   [4B] numSegments = 17
-//   [14x4B] dimOrder (56B)
-//   [17x16B] per-segment headers: [nodeCount, leafBlockCount, totalVectors, 0] => 272B
-//   [4B] seg10SplitDim
-//   [4B] seg10SplitThreshold (stored as int)
-//   Header ends at offset 4+4+56+272+8 = 344B.
-//   Concatenated nodes (seg 0..16), each nodeCount[s] x 64B
-//   Concatenated leafBlocks, each leafBlockCount[s] x 224B
-//   Concatenated leafLabels, each leafBlockCount[s] x 8B
-
-var segTotalVectors = new int[17];
-for (int s = 0; s < 16; s++) segTotalVectors[s] = segIndices[s].Count;
-segTotalVectors[10] = seg10LoArr.Length;
-segTotalVectors[16] = seg10HiArr.Length;
+// Layout (32-seg format):
+//   [4B]       magic 0x56505453 "VPTS"
+//   [4B]       numSegments = 32
+//   [14x4B]    dimOrder (56B)
+//   [32x16B]   per-segment headers: [nodeCount, leafBlockCount, totalVectors, 0] => 512B
+//   [16x8B]    split specs: [splitDim(4), splitThresh(4)] for base segs 0..15 => 128B
+//   Header ends at offset 4+4+56+512+128 = 704B.
+//   Concatenated nodes (seg 0..31), each nodeCount[s] x 64B
+//   Concatenated leafBlocks, each leafBlockCount[s] x sizeof(Block)B
+//   Concatenated leafLabels, each leafBlockCount[s] x 16B
 
 const int NewMagic = 0x56505453; // "VPTS"
 using var bw = new BinaryWriter(File.Create(output));
 bw.Write(NewMagic);
-bw.Write(17);
+bw.Write(32);
 foreach (var d in dimOrder) bw.Write(d);
-for (int s = 0; s < 17; s++)
+for (int s = 0; s < 32; s++)
 {
     bw.Write(segNodeLists[s]!.Count);
     bw.Write(segLeafBlockCounts[s]);
     bw.Write(segTotalVectors[s]);
     bw.Write(0); // reserved
 }
-bw.Write(seg10SplitDim);
-bw.Write((int)seg10SplitThresh);
-for (int s = 0; s < 17; s++) WriteNodes(bw, segNodeLists[s]!);
-for (int s = 0; s < 17; s++) bw.Write(segLeafBlockBytes[s]!);
-for (int s = 0; s < 17; s++) bw.Write(segLeafLabelBytes[s]!);
-Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, before fastpath)");
+for (int s = 0; s < 16; s++)
+{
+    bw.Write(splitDims[s]);
+    bw.Write((int)splitThreshs[s]);
+}
+for (int s = 0; s < 32; s++) WriteNodes(bw, segNodeLists[s]!);
+for (int s = 0; s < 32; s++) bw.Write(segLeafBlockBytes[s]!);
+for (int s = 0; s < 32; s++) bw.Write(segLeafLabelBytes[s]!);
+Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, 32 segs, before fastpath)");
 
 // Phase 5: append profile fast-path table to vptree.bin
 Console.WriteLine("Building and appending profile fast-path table...");

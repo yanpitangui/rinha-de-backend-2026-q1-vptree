@@ -220,19 +220,17 @@ public sealed unsafe class VpTreeEngine
     }
 }
 
-// Wraps 16 VP-trees partitioned by (has_last_tx, is_online, card_present, unknown_merchant).
-// Routes each query to its matching segment, then checks other segments only when d_k^2 exceeds
-// the guaranteed cross-segment minimum distance:
-//   has_last_tx flip -> dims 5+6 both sentinel -> min dist^2 += 2.0
-//   binary dim mismatch (is_online/card_present/unknown_merchant) -> min dist^2 += 1.0 each
+// Wraps 16/17/32 VP-trees partitioned by binary dims + optional continuous splits per base segment.
 public sealed unsafe class SegmentedVpTreeEngine
 {
     private readonly VpTreeEngine[] _segs;
     private readonly int[]          _dimOrder;
-    // _sortedNeighbors[s*15 .. s*15+14]: other segment indices sorted by ascending cross-dist[s,*]
     private readonly byte[]         _sortedNeighbors;
-    private static readonly float[] s_crossDist = BuildCrossDistTable();
-    // Seg 10 continuous split: reordered dim index and int16 threshold. -1 = no split.
+    private static readonly float[] s_crossDist16 = BuildCrossDistTable16();
+    private static readonly float[] s_crossDist32 = BuildCrossDistTable32();
+    // 32-seg: per-base-segment split spec (reordered dim, int16 threshold). null = legacy mode.
+    private readonly (int DimReordered, short Threshold)[]? _splits32;
+    // Legacy 17-seg split fields.
     private readonly int   _splitDimReordered;
     private readonly short _splitThreshold;
 
@@ -240,7 +238,7 @@ public sealed unsafe class SegmentedVpTreeEngine
     {
         _segs            = segs;
         _dimOrder        = dimOrder;
-        _sortedNeighbors = BuildSortedNeighbors();
+        _sortedNeighbors = BuildSortedNeighbors16();
         if (splitDim >= 0 && segs.Length == 17)
         {
             var rev = new int[14];
@@ -248,29 +246,57 @@ public sealed unsafe class SegmentedVpTreeEngine
             _splitDimReordered = rev[splitDim];
             _splitThreshold    = splitThreshold;
         }
-        else
-        {
-            _splitDimReordered = -1;
-        }
+        else _splitDimReordered = -1;
     }
 
-    private static float[] BuildCrossDistTable()
+    public SegmentedVpTreeEngine(VpTreeEngine[] segs, int[] dimOrder, int[] splitDims, short[] splitThreshs)
+    {
+        _segs            = segs;
+        _dimOrder        = dimOrder;
+        _sortedNeighbors = BuildSortedNeighbors32();
+        var rev = new int[14];
+        for (int di = 0; di < 14; di++) rev[dimOrder[di]] = di;
+        _splits32 = new (int, short)[16];
+        for (int s = 0; s < 16; s++)
+            _splits32[s] = (splitDims[s] >= 0 ? rev[splitDims[s]] : -1, splitThreshs[s]);
+        _splitDimReordered = -1;
+    }
+
+    private static float[] BuildCrossDistTable16()
     {
         var t = new float[16 * 16];
         for (int i = 0; i < 16; i++)
             for (int j = 0; j < 16; j++)
             {
                 float d = 0;
-                if (((i ^ j) & 8) != 0) d += 2.0f; // has_last_tx: dims 5+6 both flip sentinel
-                if (((i ^ j) & 4) != 0) d += 1.0f; // is_online
-                if (((i ^ j) & 2) != 0) d += 1.0f; // card_present
-                if (((i ^ j) & 1) != 0) d += 1.0f; // unknown_merchant
+                if (((i ^ j) & 8) != 0) d += 2.0f;
+                if (((i ^ j) & 4) != 0) d += 1.0f;
+                if (((i ^ j) & 2) != 0) d += 1.0f;
+                if (((i ^ j) & 1) != 0) d += 1.0f;
                 t[i * 16 + j] = d;
             }
         return t;
     }
 
-    private byte[] BuildSortedNeighbors()
+    private static float[] BuildCrossDistTable32()
+    {
+        var t = new float[32 * 32];
+        for (int i = 0; i < 32; i++)
+            for (int j = 0; j < 32; j++)
+            {
+                if (i % 16 == j % 16) { t[i * 32 + j] = 0f; continue; }
+                int a = i % 16, b = j % 16;
+                float d = 0;
+                if (((a ^ b) & 8) != 0) d += 2.0f;
+                if (((a ^ b) & 4) != 0) d += 1.0f;
+                if (((a ^ b) & 2) != 0) d += 1.0f;
+                if (((a ^ b) & 1) != 0) d += 1.0f;
+                t[i * 32 + j] = d;
+            }
+        return t;
+    }
+
+    private static byte[] BuildSortedNeighbors16()
     {
         var result = new byte[16 * 15];
         for (int s = 0; s < 16; s++)
@@ -278,9 +304,25 @@ public sealed unsafe class SegmentedVpTreeEngine
             var others = new (float dist, byte idx)[15];
             int k = 0;
             for (int t = 0; t < 16; t++)
-                if (t != s) others[k++] = (s_crossDist[s * 16 + t], (byte)t);
+                if (t != s) others[k++] = (s_crossDist16[s * 16 + t], (byte)t);
             Array.Sort(others, (a, b) => a.dist.CompareTo(b.dist));
             for (int i = 0; i < 15; i++) result[s * 15 + i] = others[i].idx;
+        }
+        return result;
+    }
+
+    private static byte[] BuildSortedNeighbors32()
+    {
+        var result = new byte[32 * 30];
+        for (int s = 0; s < 32; s++)
+        {
+            int partner = s < 16 ? s + 16 : s - 16;
+            var others  = new (float dist, byte idx)[30];
+            int k = 0;
+            for (int t = 0; t < 32; t++)
+                if (t != s && t != partner) others[k++] = (s_crossDist32[s * 32 + t], (byte)t);
+            Array.Sort(others, (a, b) => a.dist.CompareTo(b.dist));
+            for (int i = 0; i < 30; i++) result[s * 30 + i] = others[i].idx;
         }
         return result;
     }
@@ -288,8 +330,6 @@ public sealed unsafe class SegmentedVpTreeEngine
     [SkipLocalsInit]
     public int Search(Span<short> query, Span<float> queryFloat = default)
     {
-        // Segment key from original-order query (before variance reordering).
-        // bit3=has_last_tx (dim5!=-1), bit2=is_online (dim9=1), bit1=card_present (dim10=1), bit0=unknown_merchant (dim11=1)
         int segKey;
         if (!queryFloat.IsEmpty)
         {
@@ -301,7 +341,6 @@ public sealed unsafe class SegmentedVpTreeEngine
         }
         else
         {
-            // query[5] sentinel = -10000; binary dims are 0 or 10000
             bool hasLastTx    = query[5] > -5000;
             bool isOnline     = query[9] > 5000;
             bool cardPresent  = query[10] > 5000;
@@ -309,7 +348,6 @@ public sealed unsafe class SegmentedVpTreeEngine
             segKey = (hasLastTx ? 8 : 0) | (isOnline ? 4 : 0) | (cardPresent ? 2 : 0) | (unknownMerch ? 1 : 0);
         }
 
-        // Reorder query dims once (all 16 trees share the same dimOrder).
         Span<short> q = stackalloc short[16];
         for (int di = 0; di < 14; di++) q[di] = query[_dimOrder[di]];
         q[14] = 0; q[15] = 0;
@@ -324,41 +362,67 @@ public sealed unsafe class SegmentedVpTreeEngine
         fixed (short* qp = q)
         fixed (float* qfp = qf)
         {
-            bool isSeg10 = segKey == 10 && _splitDimReordered >= 0;
-            int  ownSeg  = segKey;
-            if (isSeg10)
-                ownSeg = qp[_splitDimReordered] > _splitThreshold ? 16 : 10;
-
-            _segs[ownSeg].SearchInto(qp, qfp, ref heap);
-
-            if (isSeg10)
-            {
-                int   otherSeg = ownSeg == 10 ? 16 : 10;
-                float gap      = MathF.Abs((float)(qp[_splitDimReordered] - _splitThreshold)) * VpTreeEngine.InvScale;
-                if (heap.Worst > gap * gap)
-                    _segs[otherSeg].SearchInto(qp, qfp, ref heap);
-            }
-
-            // Check other segments in ascending cross-dist order.
-            // heap.Worst only decreases; cross-dist only increases along sorted list -> safe early break.
-            int sortBase = segKey * 15;
-            for (int i = 0; i < 15; i++)
-            {
-                int s = _sortedNeighbors[sortBase + i];
-                if (heap.Worst <= s_crossDist[segKey * 16 + s]) break;
-                if (s == 10 && _splitDimReordered >= 0)
-                {
-                    // Seg 10 is split; from outside both halves share the same external cross-dist.
-                    _segs[10].SearchInto(qp, qfp, ref heap);
-                    _segs[16].SearchInto(qp, qfp, ref heap);
-                }
-                else
-                {
-                    _segs[s].SearchInto(qp, qfp, ref heap);
-                }
-            }
+            if (_splits32 != null)
+                Search32(segKey, qp, qfp, ref heap);
+            else
+                SearchLegacy(segKey, qp, qfp, ref heap);
         }
         return heap.FraudCount;
+    }
+
+    private void Search32(int segKey, short* qp, float* qfp, ref KnnHeap5 heap)
+    {
+        var split  = _splits32![segKey];
+        int ownSeg = (split.DimReordered >= 0 && qp[split.DimReordered] > split.Threshold)
+            ? 16 + segKey : segKey;
+        _segs[ownSeg].SearchInto(qp, qfp, ref heap);
+
+        if (split.DimReordered >= 0)
+        {
+            int   otherHalf = ownSeg < 16 ? ownSeg + 16 : ownSeg - 16;
+            float gap       = MathF.Abs((float)(qp[split.DimReordered] - split.Threshold)) * VpTreeEngine.InvScale;
+            if (heap.Worst > gap * gap)
+                _segs[otherHalf].SearchInto(qp, qfp, ref heap);
+        }
+
+        int sortBase = ownSeg * 30;
+        for (int i = 0; i < 30; i++)
+        {
+            int s = _sortedNeighbors[sortBase + i];
+            if (s_crossDist32[ownSeg * 32 + s] >= heap.Worst) break;
+            _segs[s].SearchInto(qp, qfp, ref heap);
+        }
+    }
+
+    private void SearchLegacy(int segKey, short* qp, float* qfp, ref KnnHeap5 heap)
+    {
+        bool isSeg10 = segKey == 10 && _splitDimReordered >= 0;
+        int  ownSeg  = segKey;
+        if (isSeg10)
+            ownSeg = qp[_splitDimReordered] > _splitThreshold ? 16 : 10;
+
+        _segs[ownSeg].SearchInto(qp, qfp, ref heap);
+
+        if (isSeg10)
+        {
+            int   otherSeg = ownSeg == 10 ? 16 : 10;
+            float gap      = MathF.Abs((float)(qp[_splitDimReordered] - _splitThreshold)) * VpTreeEngine.InvScale;
+            if (heap.Worst > gap * gap)
+                _segs[otherSeg].SearchInto(qp, qfp, ref heap);
+        }
+
+        int sortBase = segKey * 15;
+        for (int i = 0; i < 15; i++)
+        {
+            int s = _sortedNeighbors[sortBase + i];
+            if (heap.Worst <= s_crossDist16[segKey * 16 + s]) break;
+            if (s == 10 && _splitDimReordered >= 0)
+            {
+                _segs[10].SearchInto(qp, qfp, ref heap);
+                _segs[16].SearchInto(qp, qfp, ref heap);
+            }
+            else _segs[s].SearchInto(qp, qfp, ref heap);
+        }
     }
 }
 

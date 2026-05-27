@@ -7,11 +7,13 @@ namespace FraudApi.Data;
 // vptree.bin layout (VPTS format):
 //   numSegments=16: header = 320B (legacy)
 //   numSegments=17: header = 344B (Seg 10 split into lo[10] + hi[16])
+//   numSegments=32: header = 704B (all 16 base segs split: lo=s, hi=16+s; 16 split specs)
 //   [4B]      magic 0x56505453 "VPTS"
-//   [4B]      numSegments = 16 or 17
+//   [4B]      numSegments = 16, 17, or 32
 //   [14x4B]   dimOrder (56B)
 //   [N×16B]   per-seg headers: [nodeCount(4), leafBlockCount(4), totalVectors(4), reserved(4)]
 //   [8B]      (numSegments=17 only) seg10SplitDim(4) + seg10SplitThreshold(4)
+//   [128B]    (numSegments=32 only) 16×[splitDim(4)+splitThresh(4)] for base segs 0..15
 //   Nodes:      seg0..N-1 concatenated, nodeCount[s] × 64B each
 //   LeafBlocks: seg0..N-1 concatenated, leafBlockCount[s] × 448B each
 //   LeafLabels: seg0..N-1 concatenated, leafBlockCount[s] × 16B each
@@ -39,7 +41,7 @@ public sealed unsafe class MmapData
         using var fs = File.OpenRead(path);
 
         // Read first 8B (magic + numSegments) to determine header size.
-        Span<byte> hdr = stackalloc byte[344]; // max header size (17-seg = 344B)
+        Span<byte> hdr = stackalloc byte[704]; // max header size (32-seg = 704B)
         fs.ReadExactly(hdr[..8]);
 
         int numSegs;
@@ -49,17 +51,21 @@ public sealed unsafe class MmapData
             if (magic != Magic)
                 throw new InvalidDataException($"vptree.bin: expected 0x{Magic:X8}, got 0x{magic:X8}");
             numSegs = *(int*)(hp + 4);
-            if (numSegs != 16 && numSegs != 17)
-                throw new InvalidDataException($"vptree.bin: expected 16 or 17 segments, got {numSegs}");
+            if (numSegs != 16 && numSegs != 17 && numSegs != 32)
+                throw new InvalidDataException($"vptree.bin: expected 16, 17, or 32 segments, got {numSegs}");
         }
-        int hdrSize = numSegs == 16 ? 320 : 344; // 4+4+56+N*16[+8]
+        int hdrSize = numSegs == 16 ? 320 : numSegs == 17 ? 344 : 704;
         fs.ReadExactly(hdr[8..hdrSize]);
 
-        // Parse per-seg headers to compute fastpathOffset.
+        // Parse per-seg headers + split specs.
         var nodeCounts      = new int[numSegs];
         var leafBlockCounts = new int[numSegs];
-        int splitDim        = -1;
-        short splitThresh   = 0;
+        // Legacy 17-seg fields
+        int   legacySplitDim    = -1;
+        short legacySplitThresh = 0;
+        // New 32-seg fields
+        int[]?   splitDims32    = null;
+        short[]? splitThreshs32 = null;
         fixed (byte* hp = hdr)
         {
             int* segHdrs = (int*)(hp + 64); // offset 4+4+56=64
@@ -71,8 +77,20 @@ public sealed unsafe class MmapData
             if (numSegs == 17)
             {
                 int* ext = (int*)(hp + 64 + 17 * 16); // offset 64+272=336
-                splitDim    = ext[0];
-                splitThresh = (short)ext[1];
+                legacySplitDim    = ext[0];
+                legacySplitThresh = (short)ext[1];
+            }
+            if (numSegs == 32)
+            {
+                // Split specs start at offset 64 + 32*16 = 64+512 = 576
+                int* specs = (int*)(hp + 576);
+                splitDims32    = new int[16];
+                splitThreshs32 = new short[16];
+                for (int s = 0; s < 16; s++)
+                {
+                    splitDims32[s]    = specs[s * 2];
+                    splitThreshs32[s] = (short)specs[s * 2 + 1];
+                }
             }
         }
 
@@ -129,9 +147,13 @@ public sealed unsafe class MmapData
                     (byte*)  (ptr + leafLabelOffsets[s]),
                     dimOrder);
 
+            SegmentedVpTreeEngine engine = numSegs == 32
+                ? new SegmentedVpTreeEngine(segs, dimOrder, splitDims32!, splitThreshs32!)
+                : new SegmentedVpTreeEngine(segs, dimOrder, legacySplitDim, legacySplitThresh);
+
             return new MmapData
             {
-                _engine  = new SegmentedVpTreeEngine(segs, dimOrder, splitDim, splitThresh),
+                _engine  = engine,
                 FastPath = fastPath,
                 _data    = data
             };
