@@ -7,7 +7,7 @@ services:
       - uds-sockets:/sockets
     cpuset: "0,1,2,3"
     environment:
-      - LB_WORKERS=2
+      - LB_WORKERS=${LB_WORKERS:-2}
     depends_on:
       api1:
         condition: service_healthy
@@ -31,6 +31,7 @@ services:
       - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
       - DOTNET_PROCESSOR_COUNT=1
       - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
+      - DOTNET_EnableDiagnostics=0
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -48,7 +49,7 @@ services:
       resources:
         limits:
           cpus: "0.425"
-          memory: "160MB"
+          memory: "170MB"
 
   api2:
     image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:d58fcd7f684825276125b851d40fc5abad17ca80
@@ -58,6 +59,7 @@ services:
       - TP_MIN_WORKERS=${TP_MIN_WORKERS:-64}
       - DOTNET_PROCESSOR_COUNT=1
       - SO_BUSY_POLL=${SO_BUSY_POLL:-50}
+      - DOTNET_EnableDiagnostics=0
     volumes:
       - uds-sockets:/sockets
     healthcheck:
@@ -75,7 +77,7 @@ services:
       resources:
         limits:
           cpus: "0.425"
-          memory: "160MB"
+          memory: "170MB"
 
 volumes:
   uds-sockets:
