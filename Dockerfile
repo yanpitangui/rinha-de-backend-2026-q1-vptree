@@ -21,8 +21,9 @@ RUN dotnet publish FraudApi.csproj -c Release -r linux-musl-x64 -o /app/publish 
 # Resources — only invalidated when resources or BUCKET_SIZE change
 WORKDIR /src
 ARG BUCKET_SIZE=2048
+ARG VP_SAMPLE_SIZE=20
 COPY resources/ resources/
-RUN BUCKET_SIZE=$BUCKET_SIZE /app/preprocessor/FraudApi.PreProcessor /src/resources
+RUN BUCKET_SIZE=$BUCKET_SIZE VP_SAMPLE_SIZE=$VP_SAMPLE_SIZE /app/preprocessor/FraudApi.PreProcessor /src/resources
 
 FROM --platform=linux/amd64 alpine:3.21
 WORKDIR /appa
