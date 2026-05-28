@@ -233,6 +233,8 @@ public sealed unsafe class SegmentedVpTreeEngine
     // Legacy 17-seg split fields.
     private readonly int   _splitDimReordered;
     private readonly short _splitThreshold;
+    // KD-routing mode: per-base routing trees. null = legacy/32-seg mode.
+    private readonly RouteNodeRuntime[][]? _routeTrees;
 
     public SegmentedVpTreeEngine(VpTreeEngine[] segs, int[] dimOrder, int splitDim = -1, short splitThreshold = 0)
     {
@@ -259,6 +261,16 @@ public sealed unsafe class SegmentedVpTreeEngine
         _splits32 = new (int, short)[16];
         for (int s = 0; s < 16; s++)
             _splits32[s] = (splitDims[s] >= 0 ? rev[splitDims[s]] : -1, splitThreshs[s]);
+        _splitDimReordered = -1;
+    }
+
+    // KD-routing constructor: variable number of sub-segs with per-base routing trees.
+    public SegmentedVpTreeEngine(VpTreeEngine[] segs, int[] dimOrder, RouteNodeRuntime[][] routeTrees)
+    {
+        _segs              = segs;
+        _dimOrder          = dimOrder;
+        _routeTrees        = routeTrees;
+        _sortedNeighbors   = BuildSortedNeighbors16();
         _splitDimReordered = -1;
     }
 
@@ -362,12 +374,63 @@ public sealed unsafe class SegmentedVpTreeEngine
         fixed (short* qp = q)
         fixed (float* qfp = qf)
         {
-            if (_splits32 != null)
+            if (_routeTrees != null)
+                SearchKD(segKey, qp, qfp, ref heap);
+            else if (_splits32 != null)
                 Search32(segKey, qp, qfp, ref heap);
             else
                 SearchLegacy(segKey, qp, qfp, ref heap);
         }
         return heap.FraudCount;
+    }
+
+    private void SearchKD(int segKey, short* qp, float* qfp, ref KnnHeap5 heap)
+    {
+        SearchBaseKD(segKey, qp, qfp, ref heap);
+        int sortBase = segKey * 15;
+        for (int i = 0; i < 15; i++)
+        {
+            int b = _sortedNeighbors[sortBase + i];
+            if (s_crossDist16[segKey * 16 + b] >= heap.Worst) break;
+            SearchBaseKD(b, qp, qfp, ref heap);
+        }
+    }
+
+    [SkipLocalsInit]
+    private void SearchBaseKD(int baseIdx, short* qp, float* qfp, ref KnnHeap5 heap)
+    {
+        var tree = _routeTrees![baseIdx];
+        if (tree.Length == 0) return;
+        fixed (RouteNodeRuntime* nodes = tree)
+        {
+            StackEntry* stack = stackalloc StackEntry[64];
+            int top = 0, cur = 0; float curMin = 0f;
+            while (true)
+            {
+                if (curMin > heap.Worst)
+                {
+                    if (top == 0) break;
+                    StackEntry e = stack[--top]; cur = e.NodeIdx; curMin = e.MinDistSq;
+                    continue;
+                }
+                RouteNodeRuntime* node = nodes + cur;
+                if (node->DimReordered == -1)
+                {
+                    _segs[node->SegIdx].SearchInto(qp, qfp, ref heap);
+                    if (top == 0) break;
+                    StackEntry e = stack[--top]; cur = e.NodeIdx; curMin = e.MinDistSq;
+                    continue;
+                }
+                float qd  = qfp[node->DimReordered];
+                float thr = node->Threshold * VpTreeEngine.InvScale;
+                float gap = qd - thr;
+                int near  = gap <= 0f ? node->LoChild : node->HiChild;
+                int far   = gap <= 0f ? node->HiChild : node->LoChild;
+                float farMin = gap * gap;
+                if (farMin <= heap.Worst) stack[top++] = new StackEntry(far, farMin);
+                cur = near; curMin = 0f;
+            }
+        }
     }
 
     private void Search32(int segKey, short* qp, float* qfp, ref KnnHeap5 heap)
@@ -476,4 +539,13 @@ internal readonly struct StackEntry
     public readonly int   NodeIdx;
     public readonly float MinDistSq;
     public StackEntry(int nodeIdx, float minDistSq) { NodeIdx = nodeIdx; MinDistSq = minDistSq; }
+}
+
+public struct RouteNodeRuntime
+{
+    public int DimReordered; // reordered dim index; -1 = leaf
+    public int Threshold;    // raw int16 value (divide by Scale to get float)
+    public int LoChild;      // index into this base's route tree
+    public int HiChild;
+    public int SegIdx;       // global sub-seg index (leaves only; -1 for internal)
 }

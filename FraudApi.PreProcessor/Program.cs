@@ -102,27 +102,36 @@ for (int d = 0; d < Dims; d++) dimVariance[d] = m2[d] / total;
 var dimOrder = Enumerable.Range(0, Dims).OrderByDescending(d => dimVariance[d]).ToArray();
 Console.WriteLine($"Dim order (high->low variance): [{string.Join(", ", dimOrder)}]");
 
-// Phase 3: partition into 16 segments, split each by highest-variance continuous dim → 32 segs.
-// Segment key: bit3=has_last_tx, bit2=is_online, bit1=card_present, bit0=unknown_merchant
-// Seg layout: seg s = lo half of base seg s, seg 16+s = hi half of base seg s.
-Console.WriteLine("Partitioning into segments and building VP-trees...");
+// Phase 3: KD-routing VP-tree.
+// Each base seg (0-15) is recursively split by highest-variance continuous dim
+// until sub-seg size ≤ MaxLeafSeg. Each leaf sub-seg gets its own VP-tree.
+// Magic 0x56505454 "VPTT".
+int MaxLeafSeg = int.TryParse(Environment.GetEnvironmentVariable("MAX_LEAF_SEG"), out var ml) ? ml : 16384;
+Console.WriteLine($"Building KD-routing VP-trees (MaxLeafSeg={MaxLeafSeg}, BucketSize={BucketSize})...");
 
 var rng = new Random(42);
+
+// Reverse dim order map: original dim → reordered index
+var revDimOrder = new int[Dims];
+for (int i = 0; i < Dims; i++) revDimOrder[dimOrder[i]] = i;
 
 var segIndices = new List<int>[16];
 for (int s = 0; s < 16; s++) segIndices[s] = new List<int>(total / 16 + 1);
 for (int i = 0; i < total; i++) segIndices[GetSegKey(i)].Add(i);
 
-// 32 sub-segs + per-base split specs
-var segNodeLists       = new List<VpNode>[32];
-var segLeafBlockBytes  = new byte[32][];
-var segLeafLabelBytes  = new byte[32][];
-var segLeafBlockCounts = new int[32];
-var segTotalVectors    = new int[32];
-var splitDims          = new int[16];
-var splitThreshs       = new short[16];
+// Growable sub-seg storage
+var segNodeLists       = new List<List<VpNode>>();
+var segLeafBlockBytes  = new List<byte[]>();
+var segLeafLabelBytes  = new List<byte[]>();
+var segLeafBlockCounts = new List<int>();
+var segTotalVectors    = new List<int>();
+int nextSubSegIdx = 0;
 
-// Mutable state captured by BuildNode; reset per segment.
+// Per-base routing trees
+var baseRouteNodes = new List<RouteNode>[16];
+for (int b = 0; b < 16; b++) baseRouteNodes[b] = new List<RouteNode>();
+
+// Mutable state captured by BuildNode; reset per sub-segment.
 List<VpNode>  nodes         = null!;
 int           leafBlockCount = 0;
 MemoryStream  leafBlocksMs   = null!;
@@ -130,79 +139,116 @@ MemoryStream  leafLabelsMs   = null!;
 BinaryWriter  bwLB           = null!;
 BinaryWriter  bwLL           = null!;
 
-for (int s = 0; s < 16; s++)
+for (int b = 0; b < 16; b++)
 {
-    var baseList = segIndices[s];
-    if (baseList.Count > 1)
-    {
-        splitDims[s]    = FindBestSplitDim(baseList);
-        splitThreshs[s] = ComputeMedianForDim(baseList, splitDims[s]);
-    }
-    // else: dummy split (dim 0, thresh 0) — all go to lo
-
-    var loArr = baseList.Count > 0
-        ? baseList.Where(idx => allVecs[idx * 16 + splitDims[s]] <= splitThreshs[s]).ToArray()
-        : Array.Empty<int>();
-    var hiArr = baseList.Count > 0
-        ? baseList.Where(idx => allVecs[idx * 16 + splitDims[s]] >  splitThreshs[s]).ToArray()
-        : Array.Empty<int>();
-
-    void BuildSeg(int idx, int[] arr)
-    {
-        nodes = new List<VpNode>(); leafBlockCount = 0;
-        leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
-        bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
-        BuildNode(arr);
-        bwLB.Flush(); bwLL.Flush();
-        segNodeLists[idx]       = nodes;
-        segLeafBlockBytes[idx]  = leafBlocksMs.ToArray();
-        segLeafLabelBytes[idx]  = leafLabelsMs.ToArray();
-        segLeafBlockCounts[idx] = leafBlockCount;
-        segTotalVectors[idx]    = arr.Length;
-    }
-
-    BuildSeg(s,      loArr);
-    BuildSeg(16 + s, hiArr);
-
-    Console.WriteLine($"  Seg {s,2}: {baseList.Count,7} → lo={loArr.Length,7}, hi={hiArr.Length,7}  splitDim={splitDims[s]}, thresh={splitThreshs[s]}");
+    BuildRouteTree(segIndices[b], baseRouteNodes[b]);
+    Console.WriteLine($"  Base {b,2}: {segIndices[b].Count,7} vecs → {baseRouteNodes[b].Count} route nodes, {CountLeaves(baseRouteNodes[b])} sub-segs");
 }
 
-Console.WriteLine($"Segmented VP-trees built (32 segs): {segNodeLists.Sum(l => l!.Count)} total nodes, " +
-                  $"{segLeafBlockCounts.Sum()} total leaf blocks");
+int numSubSegs = nextSubSegIdx;
+int totalRouteNodes = baseRouteNodes.Sum(r => r.Count);
+Console.WriteLine($"KD-routing built: {numSubSegs} sub-segs, {totalRouteNodes} route nodes, " +
+                  $"{segNodeLists.Sum(l => l.Count)} VP-nodes, {segLeafBlockCounts.Sum()} leaf blocks");
 
-// Phase 4: write segmented vptree.bin
-// Layout (32-seg format):
-//   [4B]       magic 0x56505453 "VPTS"
-//   [4B]       numSegments = 32
-//   [14x4B]    dimOrder (56B)
-//   [32x16B]   per-segment headers: [nodeCount, leafBlockCount, totalVectors, 0] => 512B
-//   [16x8B]    split specs: [splitDim(4), splitThresh(4)] for base segs 0..15 => 128B
-//   Header ends at offset 4+4+56+512+128 = 704B.
-//   Concatenated nodes (seg 0..31), each nodeCount[s] x 64B
-//   Concatenated leafBlocks, each leafBlockCount[s] x sizeof(Block)B
-//   Concatenated leafLabels, each leafBlockCount[s] x 16B
+// Local helpers
 
-const int NewMagic = 0x56505453; // "VPTS"
-using var bw = new BinaryWriter(File.Create(output));
-bw.Write(NewMagic);
-bw.Write(32);
-foreach (var d in dimOrder) bw.Write(d);
-for (int s = 0; s < 32; s++)
+int BuildRouteTree(List<int> indices, List<RouteNode> routeNodes)
 {
-    bw.Write(segNodeLists[s]!.Count);
+    int nodeIdx = routeNodes.Count;
+    routeNodes.Add(default);
+
+    if (indices.Count <= MaxLeafSeg)
+    {
+        int si = AllocSeg(indices);
+        routeNodes[nodeIdx] = new RouteNode { Dim = -1, SegIdx = si };
+        return nodeIdx;
+    }
+
+    int dim   = FindBestSplitDim(indices);
+    int dimR  = revDimOrder[dim];
+    short thr = ComputeMedianForDim(indices, dim);
+
+    var lo = new List<int>(indices.Count / 2);
+    var hi = new List<int>(indices.Count / 2);
+    foreach (var idx in indices)
+        (allVecs[idx * 16 + dim] <= thr ? lo : hi).Add(idx);
+
+    if (lo.Count == 0 || hi.Count == 0)
+    {
+        int si = AllocSeg(indices);
+        routeNodes[nodeIdx] = new RouteNode { Dim = -1, SegIdx = si };
+        return nodeIdx;
+    }
+
+    int loChild = BuildRouteTree(lo, routeNodes);
+    int hiChild = BuildRouteTree(hi, routeNodes);
+    routeNodes[nodeIdx] = new RouteNode { Dim = dimR, Threshold = (int)thr, LoChild = loChild, HiChild = hiChild, SegIdx = -1 };
+    return nodeIdx;
+}
+
+int AllocSeg(List<int> indices)
+{
+    int si = nextSubSegIdx++;
+    segNodeLists.Add(null!);
+    segLeafBlockBytes.Add(null!);
+    segLeafLabelBytes.Add(null!);
+    segLeafBlockCounts.Add(0);
+    segTotalVectors.Add(0);
+
+    nodes = new List<VpNode>(); leafBlockCount = 0;
+    leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
+    bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
+    BuildNode(indices.ToArray());
+    bwLB.Flush(); bwLL.Flush();
+
+    segNodeLists[si]       = nodes;
+    segLeafBlockBytes[si]  = leafBlocksMs.ToArray();
+    segLeafLabelBytes[si]  = leafLabelsMs.ToArray();
+    segLeafBlockCounts[si] = leafBlockCount;
+    segTotalVectors[si]    = indices.Count;
+    return si;
+}
+
+int CountLeaves(List<RouteNode> rns) => rns.Count(n => n.Dim == -1);
+
+// Phase 4: write KD-routing vptree.bin (magic "VPTT")
+// Layout:
+//   [4B]                  magic 0x56505454 "VPTT"
+//   [4B]                  numSubSegs
+//   [14×4B=56B]           dimOrder
+//   [numSubSegs×16B]      per-sub-seg headers [nodeCount, leafBlockCount, totalVectors, 0]
+//   [16×4B=64B]           per-base route tree node counts
+//   [totalRouteNodes×20B] route tree nodes [dim(reordered), threshold, loChild, hiChild, segIdx]
+//   Nodes:      sub-segs 0..N-1, nodeCount[s]×64B each
+//   LeafBlocks: sub-segs 0..N-1, leafBlockCount[s]×sizeof(Block)B each
+//   LeafLabels: sub-segs 0..N-1, leafBlockCount[s]×16B each
+//   FastPath:   appended with magic 0x46415333
+
+using var bw = new BinaryWriter(File.Create(output));
+bw.Write(0x56505454); // "VPTT"
+bw.Write(numSubSegs);
+foreach (var d in dimOrder) bw.Write(d);
+for (int s = 0; s < numSubSegs; s++)
+{
+    bw.Write(segNodeLists[s].Count);
     bw.Write(segLeafBlockCounts[s]);
     bw.Write(segTotalVectors[s]);
-    bw.Write(0); // reserved
+    bw.Write(0);
 }
-for (int s = 0; s < 16; s++)
-{
-    bw.Write(splitDims[s]);
-    bw.Write((int)splitThreshs[s]);
-}
-for (int s = 0; s < 32; s++) WriteNodes(bw, segNodeLists[s]!);
-for (int s = 0; s < 32; s++) bw.Write(segLeafBlockBytes[s]!);
-for (int s = 0; s < 32; s++) bw.Write(segLeafLabelBytes[s]!);
-Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, 32 segs, before fastpath)");
+for (int b = 0; b < 16; b++) bw.Write(baseRouteNodes[b].Count);
+for (int b = 0; b < 16; b++)
+    foreach (var rn in baseRouteNodes[b])
+    {
+        bw.Write(rn.Dim);
+        bw.Write(rn.Threshold);
+        bw.Write(rn.LoChild);
+        bw.Write(rn.HiChild);
+        bw.Write(rn.SegIdx);
+    }
+for (int s = 0; s < numSubSegs; s++) WriteNodes(bw, segNodeLists[s]);
+for (int s = 0; s < numSubSegs; s++) bw.Write(segLeafBlockBytes[s]);
+for (int s = 0; s < numSubSegs; s++) bw.Write(segLeafLabelBytes[s]);
+Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, {numSubSegs} sub-segs, before fastpath)");
 
 // Phase 5: append profile fast-path table to vptree.bin
 Console.WriteLine("Building and appending profile fast-path table...");
@@ -484,6 +530,15 @@ static int FindBinS(short[] edges, short v)
     for (int b = 0; b < edges.Length; b++)
         if (v < edges[b]) return b;
     return edges.Length;
+}
+
+struct RouteNode
+{
+    public int Dim;       // reordered dim index (-1 = leaf)
+    public int Threshold; // int16 value stored as int
+    public int LoChild;   // index in this base seg's route tree (-1 if leaf)
+    public int HiChild;
+    public int SegIdx;    // global sub-seg index (leaves only, -1 for internal)
 }
 
 [StructLayout(LayoutKind.Sequential)]
