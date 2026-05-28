@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree-lb:5e7479c3a21039212fbfe2739d10b8ce2a1c1d02
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree-lb:2db2d19f035f8792b2a0b599dec2ab7f6e2ef00e
     ports:
       - "9999:9999"
     volumes:
@@ -24,7 +24,7 @@ services:
           memory: "10MB"
 
   api1:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:5e7479c3a21039212fbfe2739d10b8ce2a1c1d02
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:2db2d19f035f8792b2a0b599dec2ab7f6e2ef00e
     hostname: api1
     cpuset: "0,1"
     environment:
@@ -52,7 +52,7 @@ services:
           memory: "170MB"
 
   api2:
-    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:5e7479c3a21039212fbfe2739d10b8ce2a1c1d02
+    image: ghcr.io/yanpitangui/rinha-de-backend-2026-q1-vptree:2db2d19f035f8792b2a0b599dec2ab7f6e2ef00e
     hostname: api2
     cpuset: "2,3"
     environment:
