@@ -428,7 +428,7 @@ int FindBestSplitDim(List<int> indices)
     double bestVar = -1; int bestDim = 0;
     for (int d = 0; d < Dims; d++)
     {
-        if (d is 5 or 6 or 9 or 10 or 11) continue; // skip seg-key dims
+        if (d is 9 or 10 or 11) continue; // skip binary seg-key dims (5,6 have real values in segs 8-15)
         double sum = 0, sum2 = 0, n = indices.Count;
         foreach (var idx in indices) { double v = allVecs[idx * 16 + d]; sum += v; sum2 += v * v; }
         double variance = sum2 / n - (sum / n) * (sum / n);

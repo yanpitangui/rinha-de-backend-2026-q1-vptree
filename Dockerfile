@@ -22,7 +22,7 @@ RUN dotnet publish FraudApi.csproj -c Release -r linux-musl-x64 -o /app/publish 
 WORKDIR /src
 ARG BUCKET_SIZE=2048
 ARG VP_SAMPLE_SIZE=20
-ARG MAX_LEAF_SEG=16384
+ARG MAX_LEAF_SEG=512
 COPY resources/ resources/
 RUN BUCKET_SIZE=$BUCKET_SIZE VP_SAMPLE_SIZE=$VP_SAMPLE_SIZE MAX_LEAF_SEG=$MAX_LEAF_SEG /app/preprocessor/FraudApi.PreProcessor /src/resources
 
