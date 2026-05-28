@@ -25,6 +25,7 @@ public sealed unsafe class MmapData
     private const int MadvHugePage = 14;
     private const int Magic        = 0x56505453; // "VPTS"
     private const int MagicKD      = 0x56505454; // "VPTT" — KD-routing format
+    private const int MagicBB      = 0x56505442; // "VPTB" — KD-routing + bounding-box format
 
 #pragma warning disable CS0414
     private byte[] _data = null!; // pinned VP-tree bytes; GC must not collect while pointers live
@@ -48,6 +49,8 @@ public sealed unsafe class MmapData
         fixed (byte* mp = magic4) peekMagic = *(int*)mp;
         if (peekMagic == MagicKD)
             return LoadKD(path, fileSize);
+        if (peekMagic == MagicBB)
+            return LoadBB(path, fileSize);
         fs.Seek(0, SeekOrigin.Begin);
 
         // Read first 8B (magic + numSegments) to determine header size.
@@ -262,6 +265,128 @@ public sealed unsafe class MmapData
                     dimOrder);
 
             var engine = new SegmentedVpTreeEngine(segs, dimOrder, routeTrees);
+            return new MmapData { _engine = engine, FastPath = fastPath, _data = data };
+        }
+    }
+
+    private static MmapData LoadBB(string path, long fileSize)
+    {
+        using var fs = File.OpenRead(path);
+
+        int numSubSegs;
+        int[] dimOrder;
+        int[] nodeCounts, leafBlockCounts;
+        RouteNodeRuntime[][] routeTrees256;
+        short dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3;
+        short[] bbMins, bbMaxs;
+
+        {
+            using var br = new System.IO.BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
+            if (br.ReadInt32() != MagicBB) throw new InvalidDataException("VPTB magic mismatch");
+            numSubSegs = br.ReadInt32();
+            dimOrder = new int[14];
+            for (int i = 0; i < 14; i++) dimOrder[i] = br.ReadInt32();
+            int numBaseParts = br.ReadInt32();
+            if (numBaseParts != 256) throw new InvalidDataException($"VPTB: expected 256 base parts, got {numBaseParts}");
+
+            nodeCounts      = new int[numSubSegs];
+            leafBlockCounts = new int[numSubSegs];
+            for (int s = 0; s < numSubSegs; s++)
+            {
+                nodeCounts[s]      = br.ReadInt32();
+                leafBlockCounts[s] = br.ReadInt32();
+                br.ReadInt32(); // totalVectors
+                br.ReadInt32(); // reserved
+            }
+
+            var routeNodeCounts = new int[256];
+            for (int b = 0; b < 256; b++) routeNodeCounts[b] = br.ReadInt32();
+
+            routeTrees256 = new RouteNodeRuntime[256][];
+            for (int b = 0; b < 256; b++)
+            {
+                routeTrees256[b] = new RouteNodeRuntime[routeNodeCounts[b]];
+                for (int n = 0; n < routeNodeCounts[b]; n++)
+                    routeTrees256[b][n] = new RouteNodeRuntime
+                    {
+                        DimReordered = br.ReadInt32(),
+                        Threshold    = br.ReadInt32(),
+                        LoChild      = br.ReadInt32(),
+                        HiChild      = br.ReadInt32(),
+                        SegIdx       = br.ReadInt32()
+                    };
+            }
+
+            // Partition thresholds (5 shorts + 1 pad = 12B)
+            dim8Thresh = br.ReadInt16();
+            dim2Thresh = br.ReadInt16();
+            dim0Q1     = br.ReadInt16();
+            dim0Q2     = br.ReadInt16();
+            dim0Q3     = br.ReadInt16();
+            br.ReadInt16(); // pad
+
+            // Bounding boxes: all 256 mins then all 256 maxs (16 shorts each)
+            bbMins = new short[256 * 16];
+            bbMaxs = new short[256 * 16];
+            for (int i = 0; i < 256 * 16; i++) bbMins[i] = br.ReadInt16();
+            for (int i = 0; i < 256 * 16; i++) bbMaxs[i] = br.ReadInt16();
+
+            // Zero padding dims so they don't contribute to lower-bound calculation.
+            for (int b = 0; b < 256; b++)
+            {
+                bbMins[b * 16 + 14] = 0; bbMins[b * 16 + 15] = 0;
+                bbMaxs[b * 16 + 14] = 0; bbMaxs[b * 16 + 15] = 0;
+            }
+        }
+
+        long vpDataOffset = fs.Position;
+        long vpDataSize   = 0;
+        for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)nodeCounts[s] * 64;
+        for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)leafBlockCounts[s] * sizeof(Block);
+        for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)leafBlockCounts[s] * 16;
+
+        var data = GC.AllocateUninitializedArray<byte>((int)vpDataSize, pinned: true);
+        fs.ReadExactly(data);
+
+        ProfileFastPath? fastPath = null;
+        long fastpathSize = fileSize - vpDataOffset - vpDataSize;
+        if (fastpathSize > 0)
+        {
+            var fpBytes = new byte[fastpathSize];
+            fs.ReadExactly(fpBytes);
+            fixed (byte* fpPtr = fpBytes)
+                fastPath = ProfileFastPath.LoadFromPointer(fpPtr, fastpathSize);
+        }
+
+        fixed (byte* p = data)
+        {
+            madvise(p, (nuint)vpDataSize, MadvHugePage);
+            for (long i = 0; i < vpDataSize; i += 4096) _ = p[i];
+            mlock(p, (nuint)vpDataSize);
+        }
+
+        fixed (byte* ptr = &MemoryMarshal.GetArrayDataReference(data))
+        {
+            long curr = 0;
+            var nodeOffsets = new long[numSubSegs];
+            for (int s = 0; s < numSubSegs; s++) { nodeOffsets[s] = curr; curr += (long)nodeCounts[s] * 64; }
+
+            var leafBlockOffsets = new long[numSubSegs];
+            for (int s = 0; s < numSubSegs; s++) { leafBlockOffsets[s] = curr; curr += (long)leafBlockCounts[s] * sizeof(Block); }
+
+            var leafLabelOffsets = new long[numSubSegs];
+            for (int s = 0; s < numSubSegs; s++) { leafLabelOffsets[s] = curr; curr += (long)leafBlockCounts[s] * 16; }
+
+            var segs = new VpTreeEngine[numSubSegs];
+            for (int s = 0; s < numSubSegs; s++)
+                segs[s] = new VpTreeEngine(
+                    (VpNode*)(ptr + nodeOffsets[s]),
+                    (Block*) (ptr + leafBlockOffsets[s]),
+                    (byte*)  (ptr + leafLabelOffsets[s]),
+                    dimOrder);
+
+            var engine = new SegmentedVpTreeEngine(segs, dimOrder, routeTrees256, bbMins, bbMaxs,
+                dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3);
             return new MmapData { _engine = engine, FastPath = fastPath, _data = data };
         }
     }

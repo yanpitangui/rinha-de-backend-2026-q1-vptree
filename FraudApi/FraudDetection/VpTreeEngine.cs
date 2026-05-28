@@ -235,6 +235,10 @@ public sealed unsafe class SegmentedVpTreeEngine
     private readonly short _splitThreshold;
     // KD-routing mode: per-base routing trees. null = legacy/32-seg mode.
     private readonly RouteNodeRuntime[][]? _routeTrees;
+    // BB mode (VPTB): bounding boxes [256*16] in reordered dim space.
+    private readonly short[]? _bbMins;
+    private readonly short[]? _bbMaxs;
+    private readonly short _dim8Thresh, _dim2Thresh, _dim0Q1, _dim0Q2, _dim0Q3;
 
     public SegmentedVpTreeEngine(VpTreeEngine[] segs, int[] dimOrder, int splitDim = -1, short splitThreshold = 0)
     {
@@ -271,6 +275,28 @@ public sealed unsafe class SegmentedVpTreeEngine
         _dimOrder          = dimOrder;
         _routeTrees        = routeTrees;
         _sortedNeighbors   = BuildSortedNeighbors16();
+        _splitDimReordered = -1;
+    }
+
+    // VPTB constructor: 256-partition BB-pruned KD-routing.
+    public SegmentedVpTreeEngine(
+        VpTreeEngine[] segs, int[] dimOrder,
+        RouteNodeRuntime[][] routeTrees256,
+        short[] bbMins, short[] bbMaxs,
+        short dim8Thresh, short dim2Thresh,
+        short dim0Q1, short dim0Q2, short dim0Q3)
+    {
+        _segs              = segs;
+        _dimOrder          = dimOrder;
+        _routeTrees        = routeTrees256;
+        _bbMins            = bbMins;
+        _bbMaxs            = bbMaxs;
+        _dim8Thresh        = dim8Thresh;
+        _dim2Thresh        = dim2Thresh;
+        _dim0Q1            = dim0Q1;
+        _dim0Q2            = dim0Q2;
+        _dim0Q3            = dim0Q3;
+        _sortedNeighbors   = Array.Empty<byte>();
         _splitDimReordered = -1;
     }
 
@@ -360,6 +386,16 @@ public sealed unsafe class SegmentedVpTreeEngine
             segKey = (hasLastTx ? 8 : 0) | (isOnline ? 4 : 0) | (cardPresent ? 2 : 0) | (unknownMerch ? 1 : 0);
         }
 
+        // Extend to 8-bit key for BB mode (uses original dim-space query).
+        int segKey8 = segKey;
+        if (_bbMins != null)
+        {
+            int txCountBit  = query[8] > _dim8Thresh ? 1 : 0;
+            int amtVsAvgBit = query[2] > _dim2Thresh ? 1 : 0;
+            int amtBucket   = GetDim0Bucket(query[0]);
+            segKey8 = segKey | (txCountBit << 4) | (amtVsAvgBit << 5) | (amtBucket << 6);
+        }
+
         Span<short> q = stackalloc short[16];
         for (int di = 0; di < 14; di++) q[di] = query[_dimOrder[di]];
         q[14] = 0; q[15] = 0;
@@ -374,7 +410,9 @@ public sealed unsafe class SegmentedVpTreeEngine
         fixed (short* qp = q)
         fixed (float* qfp = qf)
         {
-            if (_routeTrees != null)
+            if (_bbMins != null)
+                SearchBB(segKey8, qp, qfp, ref heap);
+            else if (_routeTrees != null)
                 SearchKD(segKey, qp, qfp, ref heap);
             else if (_splits32 != null)
                 Search32(segKey, qp, qfp, ref heap);
@@ -382,6 +420,15 @@ public sealed unsafe class SegmentedVpTreeEngine
                 SearchLegacy(segKey, qp, qfp, ref heap);
         }
         return heap.FraudCount;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetDim0Bucket(short v)
+    {
+        if (v <= _dim0Q1) return 0;
+        if (v <= _dim0Q2) return 1;
+        if (v <= _dim0Q3) return 2;
+        return 3;
     }
 
     private void SearchKD(int segKey, short* qp, float* qfp, ref KnnHeap5 heap)
@@ -394,6 +441,68 @@ public sealed unsafe class SegmentedVpTreeEngine
             if (s_crossDist16[segKey * 16 + b] >= heap.Worst) break;
             SearchBaseKD(b, qp, qfp, ref heap);
         }
+    }
+
+    [SkipLocalsInit]
+    private void SearchBB(int primaryKey, short* qp, float* qfp, ref KnnHeap5 heap)
+    {
+        SearchBaseKD(primaryKey, qp, qfp, ref heap);
+
+        Span<long> bounds = stackalloc long[256];
+        fixed (short* mins = _bbMins)
+        fixed (short* maxs = _bbMaxs)
+        {
+            for (int b = 0; b < 256; b++)
+            {
+                if (b == primaryKey) { bounds[b] = 0; continue; }
+                bounds[b] = LowerBoundBoxAvx2(qp, mins + b * 16, maxs + b * 16);
+            }
+        }
+
+        // Insertion sort 256 indices by bound ascending.
+        Span<byte> order = stackalloc byte[256];
+        for (int i = 0; i < 256; i++) order[i] = (byte)i;
+        for (int i = 1; i < 256; i++)
+        {
+            byte key      = order[i];
+            long keyBound = bounds[key];
+            int  j        = i - 1;
+            while (j >= 0 && bounds[order[j]] > keyBound)
+            {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = key;
+        }
+
+        const long ScaleSq = (long)Vectorizer.Scale * Vectorizer.Scale;
+        long worstInt = (long)((double)heap.Worst * ScaleSq);
+        for (int i = 0; i < 256; i++)
+        {
+            byte idx = order[i];
+            if (bounds[idx] > worstInt) break;
+            if (idx == (byte)primaryKey) continue;
+            SearchBaseKD(idx, qp, qfp, ref heap);
+            worstInt = (long)((double)heap.Worst * ScaleSq);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long LowerBoundBoxAvx2(short* q, short* min, short* max)
+    {
+        var vq    = Vector256.Load(q);
+        var vmin  = Vector256.Load(min);
+        var vmax  = Vector256.Load(max);
+        var zero  = Vector256<short>.Zero;
+        var below = Avx2.Max(Avx2.Subtract(vmin, vq), zero); // max(min-q, 0)
+        var above = Avx2.Max(Avx2.Subtract(vq, vmax), zero); // max(q-max, 0)
+        var diff  = Avx2.Max(below, above);
+        var sq    = Avx2.MultiplyAddAdjacent(diff, diff);     // 8×int32 pair-sums
+        var lo64  = Avx2.ConvertToVector256Int64(sq.GetLower());
+        var hi64  = Avx2.ConvertToVector256Int64(sq.GetUpper());
+        var s64   = Avx2.Add(lo64, hi64);
+        var s2    = Sse2.Add(s64.GetLower(), s64.GetUpper());
+        return s2.GetElement(0) + s2.GetElement(1);
     }
 
     [SkipLocalsInit]
@@ -416,7 +525,8 @@ public sealed unsafe class SegmentedVpTreeEngine
                 RouteNodeRuntime* node = nodes + cur;
                 if (node->DimReordered == -1)
                 {
-                    _segs[node->SegIdx].SearchInto(qp, qfp, ref heap);
+                    if (node->SegIdx >= 0)
+                        _segs[node->SegIdx].SearchInto(qp, qfp, ref heap);
                     if (top == 0) break;
                     StackEntry e = stack[--top]; cur = e.NodeIdx; curMin = e.MinDistSq;
                     continue;
