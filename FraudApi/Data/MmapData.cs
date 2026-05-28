@@ -277,6 +277,7 @@ public sealed unsafe class MmapData
         int[] dimOrder;
         int[] nodeCounts, leafBlockCounts;
         RouteNodeRuntime[][] routeTrees256;
+        short[][] routeBoxes256;
         short dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3;
         short[] bbMins, bbMaxs;
 
@@ -315,6 +316,16 @@ public sealed unsafe class MmapData
                         HiChild      = br.ReadInt32(),
                         SegIdx       = br.ReadInt32()
                     };
+            }
+
+            // Route node boxes: per node 16 min shorts + 16 max shorts (stride 32).
+            routeBoxes256 = new short[256][];
+            for (int b = 0; b < 256; b++)
+            {
+                int cnt = routeNodeCounts[b];
+                var arr = new short[cnt * 32];
+                for (int i = 0; i < cnt * 32; i++) arr[i] = br.ReadInt16();
+                routeBoxes256[b] = arr;
             }
 
             // Partition thresholds (5 shorts + 1 pad = 12B)
@@ -385,7 +396,7 @@ public sealed unsafe class MmapData
                     (byte*)  (ptr + leafLabelOffsets[s]),
                     dimOrder);
 
-            var engine = new SegmentedVpTreeEngine(segs, dimOrder, routeTrees256, bbMins, bbMaxs,
+            var engine = new SegmentedVpTreeEngine(segs, dimOrder, routeTrees256, routeBoxes256, bbMins, bbMaxs,
                 dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3);
             return new MmapData { _engine = engine, FastPath = fastPath, _data = data };
         }

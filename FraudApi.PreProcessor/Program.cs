@@ -156,7 +156,14 @@ BinaryWriter  bwLL           = null!;
 
 for (int b = 0; b < NumBaseParts; b++)
 {
-    if (segIndices[b].Count == 0) { baseRouteNodes[b].Add(new RouteNode { Dim = -1, SegIdx = -1 }); continue; }
+    if (segIndices[b].Count == 0)
+    {
+        // Never-visit box: min=MaxValue, max=MinValue → box lower bound is huge.
+        var emptyMin = new short[16]; var emptyMax = new short[16];
+        for (int d = 0; d < 16; d++) { emptyMin[d] = short.MaxValue; emptyMax[d] = short.MinValue; }
+        baseRouteNodes[b].Add(new RouteNode { Dim = -1, SegIdx = -1, BoxMin = emptyMin, BoxMax = emptyMax });
+        continue;
+    }
     BuildRouteTree(segIndices[b], baseRouteNodes[b]);
 }
 
@@ -191,6 +198,7 @@ Console.WriteLine($"VPTB built: {numSubSegs} sub-segs, {totalRouteNodes} route n
 // [numSubSegs×16B] per-sub-seg headers [nodeCount, leafBlockCount, totalVectors, 0]
 // [256×4B=1KB] per-base route node counts
 // [totalRouteNodes×20B] route tree nodes
+// [totalRouteNodes×32×2B] route node boxes: per node 16 min shorts + 16 max shorts (reordered space)
 // [3×2B=6B] partition thresholds: dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3 (+ 1B pad to even)
 // [256×16×2B×2 = 16KB] bounding boxes: all mins then all maxs (16 shorts each, 2 padding dims)
 // Nodes, LeafBlocks, LeafLabels, FastPath
@@ -212,6 +220,13 @@ for (int b = 0; b < NumBaseParts; b++)
     {
         bw.Write(rn.Dim); bw.Write(rn.Threshold);
         bw.Write(rn.LoChild); bw.Write(rn.HiChild); bw.Write(rn.SegIdx);
+    }
+// Route node boxes: per node 16 min shorts then 16 max shorts (reordered space)
+for (int b = 0; b < NumBaseParts; b++)
+    foreach (var rn in baseRouteNodes[b])
+    {
+        for (int d = 0; d < 16; d++) bw.Write(rn.BoxMin[d]);
+        for (int d = 0; d < 16; d++) bw.Write(rn.BoxMax[d]);
     }
 // Partition thresholds (5 shorts + 1 pad short = 12B)
 bw.Write(dim8Thresh); bw.Write(dim2Thresh);
@@ -261,10 +276,12 @@ int BuildRouteTree(List<int> indices, List<RouteNode> routeNodes)
     int nodeIdx = routeNodes.Count;
     routeNodes.Add(default);
 
+    ComputeReorderedBox(indices, out var boxMin, out var boxMax);
+
     if (indices.Count <= MaxLeafSeg)
     {
         int si = AllocSeg(indices);
-        routeNodes[nodeIdx] = new RouteNode { Dim = -1, SegIdx = si };
+        routeNodes[nodeIdx] = new RouteNode { Dim = -1, SegIdx = si, BoxMin = boxMin, BoxMax = boxMax };
         return nodeIdx;
     }
 
@@ -280,14 +297,33 @@ int BuildRouteTree(List<int> indices, List<RouteNode> routeNodes)
     if (lo.Count == 0 || hi.Count == 0)
     {
         int si = AllocSeg(indices);
-        routeNodes[nodeIdx] = new RouteNode { Dim = -1, SegIdx = si };
+        routeNodes[nodeIdx] = new RouteNode { Dim = -1, SegIdx = si, BoxMin = boxMin, BoxMax = boxMax };
         return nodeIdx;
     }
 
     int loChild = BuildRouteTree(lo, routeNodes);
     int hiChild = BuildRouteTree(hi, routeNodes);
-    routeNodes[nodeIdx] = new RouteNode { Dim = dimR, Threshold = (int)thr, LoChild = loChild, HiChild = hiChild, SegIdx = -1 };
+    routeNodes[nodeIdx] = new RouteNode { Dim = dimR, Threshold = (int)thr, LoChild = loChild, HiChild = hiChild, SegIdx = -1, BoxMin = boxMin, BoxMax = boxMax };
     return nodeIdx;
+}
+
+void ComputeReorderedBox(List<int> indices, out short[] boxMin, out short[] boxMax)
+{
+    boxMin = new short[16];
+    boxMax = new short[16];
+    for (int d = 0; d < 16; d++) { boxMin[d] = short.MaxValue; boxMax[d] = short.MinValue; }
+    foreach (int idx in indices)
+    {
+        int vb = idx * 16;
+        for (int d = 0; d < Dims; d++)
+        {
+            short v = allVecs[vb + dimOrder[d]]; // reordered
+            if (v < boxMin[d]) boxMin[d] = v;
+            if (v > boxMax[d]) boxMax[d] = v;
+        }
+    }
+    // Pad dims 14,15 → 0 so they never contribute to box lower bound.
+    boxMin[14] = 0; boxMin[15] = 0; boxMax[14] = 0; boxMax[15] = 0;
 }
 
 int AllocSeg(List<int> indices)
@@ -387,7 +423,7 @@ int BuildNode(int[] indices)
         return nodeIdx;
     }
 
-    float mu = MathF.Sqrt((float)distPairs[mid - 1].dsq) / Scale;
+    float mu = MathF.Sqrt((float)distPairs[mid - 1].dsq); // raw linear int distance (integer currency)
     var leftArr  = new int[mid];
     var rightArr = new int[nonVpCount - mid];
     for (int i = 0; i < mid; i++)        leftArr[i]        = distPairs[i].idx;
@@ -539,6 +575,8 @@ struct RouteNode
     public int LoChild;
     public int HiChild;
     public int SegIdx;
+    public short[] BoxMin; // 16 shorts, reordered dim space (14 real + 2 pad)
+    public short[] BoxMax;
 }
 
 [StructLayout(LayoutKind.Sequential)]
