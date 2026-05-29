@@ -30,7 +30,11 @@ FROM --platform=linux/amd64 alpine:3.21
 WORKDIR /appa
 
 COPY --from=builder /app/publish .
-COPY --from=builder /src/resources /resources
+# Runtime needs only the generated tree + the two vectorization-constant JSONs.
+# references.json.gz (preprocessor input) and any stale dataset.bin/fastpath.bin stay out.
+COPY --from=builder /src/resources/vptree.bin /resources/vptree.bin
+COPY --from=builder /src/resources/mcc_risk.json /resources/mcc_risk.json
+COPY --from=builder /src/resources/normalization.json /resources/normalization.json
 
 ENV RESOURCES_PATH=/resources
 ENTRYPOINT ["./FraudApi"]

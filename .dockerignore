@@ -3,6 +3,9 @@ lb/
 *.md
 OPTIMIZATION_PLAN.md
 resources/references.json
+resources/dataset.bin
+resources/fastpath.bin
+resources/vptree.bin
 **/bin/
 **/obj/
 **/.zig-cache/
