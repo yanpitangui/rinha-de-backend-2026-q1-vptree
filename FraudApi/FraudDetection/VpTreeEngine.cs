@@ -29,14 +29,16 @@ public sealed unsafe class VpTreeEngine
     private readonly VpNode* _nodes;
     private readonly Block*  _leafBlocks;
     private readonly byte*   _leafLabels;
+    private readonly short*  _leafBoxes;   // per-block boxes [blockCount*32] (16 min + 16 max), reordered space; null = none
     private readonly int[]   _dimOrder;
 
-    public VpTreeEngine(VpNode* nodes, Block* leafBlocks, byte* leafLabels, int[] dimOrder)
+    public VpTreeEngine(VpNode* nodes, Block* leafBlocks, byte* leafLabels, int[] dimOrder, short* leafBoxes = null)
     {
         _nodes      = nodes;
         _leafBlocks = leafBlocks;
         _leafLabels = leafLabels;
         _dimOrder   = dimOrder;
+        _leafBoxes  = leafBoxes;
     }
 
     [SkipLocalsInit]
@@ -130,6 +132,13 @@ public sealed unsafe class VpTreeEngine
             if (bi + 7 < blockCount)
                 Sse.Prefetch0(_leafBlocks + blockStart + bi + 7);
 
+            // Per-block box lower bound: skip the whole 16-vector block in 14 ops if it can't beat the heap.
+            if (_leafBoxes != null)
+            {
+                short* bx = _leafBoxes + ((long)(blockStart + bi) << 5); // *32
+                if (LowerBoundBoxAvx2(qp, bx, bx + 16) > boundSq) continue;
+            }
+
             Block* block = _leafBlocks + blockStart + bi;
             if (!ProcessBlock(block, qp, dptr, boundSq)) continue;
 
@@ -201,6 +210,25 @@ public sealed unsafe class VpTreeEngine
             for (int i = 0; i < 16; i++) { long d = dd[i] - qd; dptr[i] += d * d; }
         }
         return true;
+    }
+
+    // Box lower bound (raw int16 squared) over 14 dims (+2 zero pad dims): clamped axis gaps, summed.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static long LowerBoundBoxAvx2(short* q, short* min, short* max)
+    {
+        var vq    = Vector256.Load(q);
+        var vmin  = Vector256.Load(min);
+        var vmax  = Vector256.Load(max);
+        var zero  = Vector256<short>.Zero;
+        var below = Avx2.Max(Avx2.Subtract(vmin, vq), zero); // max(min-q, 0)
+        var above = Avx2.Max(Avx2.Subtract(vq, vmax), zero); // max(q-max, 0)
+        var diff  = Avx2.Max(below, above);
+        var sq    = Avx2.MultiplyAddAdjacent(diff, diff);     // 8×int32 pair-sums
+        var lo64  = Avx2.ConvertToVector256Int64(sq.GetLower());
+        var hi64  = Avx2.ConvertToVector256Int64(sq.GetUpper());
+        var s64   = Avx2.Add(lo64, hi64);
+        var s2    = Sse2.Add(s64.GetLower(), s64.GetUpper());
+        return s2.GetElement(0) + s2.GetElement(1);
     }
 
     // Raw int16 squared distance (no normalization, no sqrt) over 16 lanes.
@@ -444,7 +472,7 @@ public sealed unsafe class SegmentedVpTreeEngine
             for (int b = 0; b < 256; b++)
             {
                 if (b == primaryKey) { bounds[b] = 0; continue; }
-                bounds[b] = LowerBoundBoxAvx2(qp, mins + b * 16, maxs + b * 16);
+                bounds[b] = VpTreeEngine.LowerBoundBoxAvx2(qp, mins + b * 16, maxs + b * 16);
             }
         }
 
@@ -472,24 +500,6 @@ public sealed unsafe class SegmentedVpTreeEngine
             if (idx == (byte)primaryKey) continue;
             SearchBaseKD(idx, qp, ref heap);
         }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static long LowerBoundBoxAvx2(short* q, short* min, short* max)
-    {
-        var vq    = Vector256.Load(q);
-        var vmin  = Vector256.Load(min);
-        var vmax  = Vector256.Load(max);
-        var zero  = Vector256<short>.Zero;
-        var below = Avx2.Max(Avx2.Subtract(vmin, vq), zero); // max(min-q, 0)
-        var above = Avx2.Max(Avx2.Subtract(vq, vmax), zero); // max(q-max, 0)
-        var diff  = Avx2.Max(below, above);
-        var sq    = Avx2.MultiplyAddAdjacent(diff, diff);     // 8×int32 pair-sums
-        var lo64  = Avx2.ConvertToVector256Int64(sq.GetLower());
-        var hi64  = Avx2.ConvertToVector256Int64(sq.GetUpper());
-        var s64   = Avx2.Add(lo64, hi64);
-        var s2    = Sse2.Add(s64.GetLower(), s64.GetUpper());
-        return s2.GetElement(0) + s2.GetElement(1);
     }
 
     // Box branch-and-bound over a base's route tree. Each node carries its subtree's
@@ -524,8 +534,8 @@ public sealed unsafe class SegmentedVpTreeEngine
                 }
 
                 int lo = node->LoChild, hi = node->HiChild;
-                long lb = LowerBoundBoxAvx2(qp, box + lo * 32, box + lo * 32 + 16);
-                long rb = LowerBoundBoxAvx2(qp, box + hi * 32, box + hi * 32 + 16);
+                long lb = VpTreeEngine.LowerBoundBoxAvx2(qp, box + lo * 32, box + lo * 32 + 16);
+                long rb = VpTreeEngine.LowerBoundBoxAvx2(qp, box + hi * 32, box + hi * 32 + 16);
 
                 int near, far; long nearB, farB;
                 if (lb <= rb) { near = lo; nearB = lb; far = hi; farB = rb; }

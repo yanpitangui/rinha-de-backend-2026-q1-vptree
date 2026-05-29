@@ -25,7 +25,7 @@ public sealed unsafe class MmapData
     private const int MadvHugePage = 14;
     private const int Magic        = 0x56505453; // "VPTS"
     private const int MagicKD      = 0x56505454; // "VPTT" — KD-routing format
-    private const int MagicBB      = 0x56505442; // "VPTB" — KD-routing + bounding-box format
+    private const int MagicBB      = 0x56505443; // "VPTC" — KD-routing + partition boxes + per-leaf-block boxes
 
 #pragma warning disable CS0414
     private byte[] _data = null!; // pinned VP-tree bytes; GC must not collect while pointers live
@@ -283,7 +283,7 @@ public sealed unsafe class MmapData
 
         {
             using var br = new System.IO.BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
-            if (br.ReadInt32() != MagicBB) throw new InvalidDataException("VPTB magic mismatch");
+            if (br.ReadInt32() != MagicBB) throw new InvalidDataException("VPTC magic mismatch");
             numSubSegs = br.ReadInt32();
             dimOrder = new int[14];
             for (int i = 0; i < 14; i++) dimOrder[i] = br.ReadInt32();
@@ -355,19 +355,26 @@ public sealed unsafe class MmapData
         for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)nodeCounts[s] * 64;
         for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)leafBlockCounts[s] * sizeof(Block);
         for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)leafBlockCounts[s] * 16;
+        for (int s = 0; s < numSubSegs; s++) vpDataSize += (long)leafBlockCounts[s] * 64; // per-block boxes (32 shorts)
 
-        var data = GC.AllocateUninitializedArray<byte>((int)vpDataSize, pinned: true);
-        fs.ReadExactly(data);
-
+        // Parse + free the fastpath temp buffer BEFORE allocating the large pinned VP-data array,
+        // so the two never coexist (keeps the load-time RSS peak under the container limit).
         ProfileFastPath? fastPath = null;
-        long fastpathSize = fileSize - vpDataOffset - vpDataSize;
+        long fastpathOffset = vpDataOffset + vpDataSize;
+        long fastpathSize   = fileSize - fastpathOffset;
         if (fastpathSize > 0)
         {
+            fs.Seek(fastpathOffset, SeekOrigin.Begin);
             var fpBytes = new byte[fastpathSize];
             fs.ReadExactly(fpBytes);
             fixed (byte* fpPtr = fpBytes)
                 fastPath = ProfileFastPath.LoadFromPointer(fpPtr, fastpathSize);
         }
+        GC.Collect(); // reclaim fpBytes before the pinned allocation
+
+        fs.Seek(vpDataOffset, SeekOrigin.Begin);
+        var data = GC.AllocateUninitializedArray<byte>((int)vpDataSize, pinned: true);
+        fs.ReadExactly(data);
 
         fixed (byte* p = data)
         {
@@ -388,13 +395,17 @@ public sealed unsafe class MmapData
             var leafLabelOffsets = new long[numSubSegs];
             for (int s = 0; s < numSubSegs; s++) { leafLabelOffsets[s] = curr; curr += (long)leafBlockCounts[s] * 16; }
 
+            var leafBoxOffsets = new long[numSubSegs];
+            for (int s = 0; s < numSubSegs; s++) { leafBoxOffsets[s] = curr; curr += (long)leafBlockCounts[s] * 64; }
+
             var segs = new VpTreeEngine[numSubSegs];
             for (int s = 0; s < numSubSegs; s++)
                 segs[s] = new VpTreeEngine(
                     (VpNode*)(ptr + nodeOffsets[s]),
                     (Block*) (ptr + leafBlockOffsets[s]),
                     (byte*)  (ptr + leafLabelOffsets[s]),
-                    dimOrder);
+                    dimOrder,
+                    (short*) (ptr + leafBoxOffsets[s]));
 
             var engine = new SegmentedVpTreeEngine(segs, dimOrder, routeTrees256, routeBoxes256, bbMins, bbMaxs,
                 dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3);

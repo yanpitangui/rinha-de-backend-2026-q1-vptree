@@ -123,7 +123,7 @@ Console.WriteLine($"Partition thresholds: dim8={dim8Thresh}, dim2={dim2Thresh}, 
 
 // Phase 3: KD-routing VP-tree with 256 partitions + bounding boxes.
 // Partition key: 8 bits = 4 binary dims + dim8 median + dim2 median + dim0 2-bit bucket.
-// Magic 0x56505442 "VPTB".
+// Magic 0x56505443 "VPTC" (adds per-leaf-block bounding boxes + intra-leaf spatial sort).
 const int NumBaseParts = 256;
 int MaxLeafSeg = int.TryParse(Environment.GetEnvironmentVariable("MAX_LEAF_SEG"), out var ml) ? ml : 512;
 Console.WriteLine($"Building VPTB (256-partition + bounding-box, MaxLeafSeg={MaxLeafSeg}, BucketSize={BucketSize})...");
@@ -137,11 +137,12 @@ var segIndices = new List<int>[NumBaseParts];
 for (int s = 0; s < NumBaseParts; s++) segIndices[s] = new List<int>(total / NumBaseParts + 1);
 for (int i = 0; i < total; i++) segIndices[GetSegKey(i)].Add(i);
 
-var segNodeLists       = new List<List<VpNode>>();
-var segLeafBlockBytes  = new List<byte[]>();
-var segLeafLabelBytes  = new List<byte[]>();
-var segLeafBlockCounts = new List<int>();
-var segTotalVectors    = new List<int>();
+var segNodeLists         = new List<List<VpNode>>();
+var segLeafBlockBytes    = new List<byte[]>();
+var segLeafLabelBytes    = new List<byte[]>();
+var segLeafBlockBoxBytes = new List<byte[]>();
+var segLeafBlockCounts   = new List<int>();
+var segTotalVectors      = new List<int>();
 int nextSubSegIdx = 0;
 
 var baseRouteNodes = new List<RouteNode>[NumBaseParts];
@@ -151,8 +152,10 @@ List<VpNode>  nodes        = null!;
 int           leafBlockCount = 0;
 MemoryStream  leafBlocksMs   = null!;
 MemoryStream  leafLabelsMs   = null!;
+MemoryStream  leafBoxesMs    = null!;
 BinaryWriter  bwLB           = null!;
 BinaryWriter  bwLL           = null!;
+BinaryWriter  bwBOX          = null!;
 
 for (int b = 0; b < NumBaseParts; b++)
 {
@@ -190,8 +193,8 @@ int totalRouteNodes = baseRouteNodes.Sum(r => r.Count);
 Console.WriteLine($"VPTB built: {numSubSegs} sub-segs, {totalRouteNodes} route nodes, " +
                   $"{segNodeLists.Sum(l => l.Count)} VP-nodes, {segLeafBlockCounts.Sum()} leaf blocks");
 
-// Phase 4: write VPTB format.
-// [4B] magic 0x56505442 "VPTB"
+// Phase 4: write VPTC format.
+// [4B] magic 0x56505443 "VPTC"
 // [4B] numSubSegs
 // [14×4B=56B] dimOrder
 // [4B] numBaseParts = 256
@@ -201,9 +204,9 @@ Console.WriteLine($"VPTB built: {numSubSegs} sub-segs, {totalRouteNodes} route n
 // [totalRouteNodes×32×2B] route node boxes: per node 16 min shorts + 16 max shorts (reordered space)
 // [3×2B=6B] partition thresholds: dim8Thresh, dim2Thresh, dim0Q1, dim0Q2, dim0Q3 (+ 1B pad to even)
 // [256×16×2B×2 = 16KB] bounding boxes: all mins then all maxs (16 shorts each, 2 padding dims)
-// Nodes, LeafBlocks, LeafLabels, FastPath
+// Nodes, LeafBlocks, LeafLabels, LeafBlockBoxes, FastPath
 using var bw = new BinaryWriter(File.Create(output));
-bw.Write(0x56505442); // "VPTB"
+bw.Write(0x56505443); // "VPTC"
 bw.Write(numSubSegs);
 foreach (var d in dimOrder) bw.Write(d);
 bw.Write(NumBaseParts);
@@ -240,6 +243,8 @@ for (int b = 0; b < NumBaseParts; b++)
 for (int s = 0; s < numSubSegs; s++) WriteNodes(bw, segNodeLists[s]);
 for (int s = 0; s < numSubSegs; s++) bw.Write(segLeafBlockBytes[s]);
 for (int s = 0; s < numSubSegs; s++) bw.Write(segLeafLabelBytes[s]);
+// Per-leaf-block bounding boxes: leafBlockCount[s] × 64B (16 min shorts + 16 max shorts, reordered space)
+for (int s = 0; s < numSubSegs; s++) bw.Write(segLeafBlockBoxBytes[s]);
 Console.WriteLine($"Written {output} ({new FileInfo(output).Length / 1024.0 / 1024.0:F1} MiB, {numSubSegs} sub-segs, before fastpath)");
 
 Console.WriteLine("Building and appending profile fast-path table...");
@@ -332,20 +337,22 @@ int AllocSeg(List<int> indices)
     segNodeLists.Add(null!);
     segLeafBlockBytes.Add(null!);
     segLeafLabelBytes.Add(null!);
+    segLeafBlockBoxBytes.Add(null!);
     segLeafBlockCounts.Add(0);
     segTotalVectors.Add(0);
 
     nodes = new List<VpNode>(); leafBlockCount = 0;
-    leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream();
-    bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs);
+    leafBlocksMs = new MemoryStream(); leafLabelsMs = new MemoryStream(); leafBoxesMs = new MemoryStream();
+    bwLB = new BinaryWriter(leafBlocksMs); bwLL = new BinaryWriter(leafLabelsMs); bwBOX = new BinaryWriter(leafBoxesMs);
     BuildNode(indices.ToArray());
-    bwLB.Flush(); bwLL.Flush();
+    bwLB.Flush(); bwLL.Flush(); bwBOX.Flush();
 
-    segNodeLists[si]       = nodes;
-    segLeafBlockBytes[si]  = leafBlocksMs.ToArray();
-    segLeafLabelBytes[si]  = leafLabelsMs.ToArray();
-    segLeafBlockCounts[si] = leafBlockCount;
-    segTotalVectors[si]    = indices.Count;
+    segNodeLists[si]         = nodes;
+    segLeafBlockBytes[si]    = leafBlocksMs.ToArray();
+    segLeafLabelBytes[si]    = leafLabelsMs.ToArray();
+    segLeafBlockBoxBytes[si] = leafBoxesMs.ToArray();
+    segLeafBlockCounts[si]   = leafBlockCount;
+    segTotalVectors[si]      = indices.Count;
     return si;
 }
 
@@ -361,6 +368,64 @@ void WriteNodes(BinaryWriter w, List<VpNode> nodeList)
     }
 }
 
+// Writes a VP-leaf's vectors as column-major blocks + labels + per-block bounding boxes.
+// Vectors are first spatially sorted (dominant-variance dim) so each 16-vector block is
+// tight along that axis → its box lower bound prunes the block before any distance scan.
+(int blockStart, int nBlocks) EmitLeaf(int[] leafIdx)
+{
+    SortLeafSpatial(leafIdx);
+    int blockStart = leafBlockCount;
+    int nBlocks    = (leafIdx.Length + 15) / 16;
+    Span<short> bMin = stackalloc short[16];
+    Span<short> bMax = stackalloc short[16];
+    for (int bi = 0; bi < nBlocks; bi++)
+    {
+        for (int d = 0; d < 16; d++) { bMin[d] = short.MaxValue; bMax[d] = short.MinValue; }
+        for (int di = 0; di < Dims; di++)
+            for (int pos = 0; pos < 16; pos++)
+            {
+                int mi = bi * 16 + pos;
+                if (mi < leafIdx.Length)
+                {
+                    short v = allVecs[leafIdx[mi] * 16 + dimOrder[di]];
+                    bwLB.Write(v);
+                    if (v < bMin[di]) bMin[di] = v;
+                    if (v > bMax[di]) bMax[di] = v;
+                }
+                else bwLB.Write(PaddingSentinel);
+            }
+        for (int pos = 0; pos < 16; pos++)
+        {
+            int mi = bi * 16 + pos;
+            bwLL.Write(mi < leafIdx.Length ? allLabels[leafIdx[mi]] : (byte)0);
+        }
+        // Pad dims 14,15 contribute 0 to the box lower bound.
+        bMin[14] = 0; bMin[15] = 0; bMax[14] = 0; bMax[15] = 0;
+        for (int d = 0; d < 16; d++) bwBOX.Write(bMin[d]);
+        for (int d = 0; d < 16; d++) bwBOX.Write(bMax[d]);
+    }
+    leafBlockCount += nBlocks;
+    return (blockStart, nBlocks);
+}
+
+// In-place sort of a leaf's vector indices by the highest-variance original dim,
+// clustering spatially-near vectors into the same 16-vector block.
+void SortLeafSpatial(int[] idx)
+{
+    if (idx.Length <= 16) return;
+    double bestVar = -1; int bestDim = 0; int n = idx.Length;
+    for (int d = 0; d < Dims; d++)
+    {
+        if (d is 9 or 10 or 11) continue; // binary seg-key dims
+        double sum = 0, sum2 = 0;
+        foreach (var i in idx) { double v = allVecs[i * 16 + d]; sum += v; sum2 += v * v; }
+        double variance = sum2 / n - (sum / n) * (sum / n);
+        if (variance > bestVar) { bestVar = variance; bestDim = d; }
+    }
+    int bd = bestDim;
+    Array.Sort(idx, (a, b) => allVecs[a * 16 + bd].CompareTo(allVecs[b * 16 + bd]));
+}
+
 int BuildNode(int[] indices)
 {
     int nodeIdx = nodes.Count;
@@ -368,24 +433,7 @@ int BuildNode(int[] indices)
 
     if (indices.Length <= BucketSize)
     {
-        int blockStart = leafBlockCount;
-        int nBlocks    = (indices.Length + 15) / 16;
-        for (int bi = 0; bi < nBlocks; bi++)
-        {
-            for (int di = 0; di < Dims; di++)
-                for (int pos = 0; pos < 16; pos++)
-                {
-                    int mi = bi * 16 + pos;
-                    short v = mi < indices.Length ? allVecs[indices[mi] * 16 + dimOrder[di]] : PaddingSentinel;
-                    bwLB.Write(v);
-                }
-            for (int pos = 0; pos < 16; pos++)
-            {
-                int mi = bi * 16 + pos;
-                bwLL.Write(mi < indices.Length ? allLabels[indices[mi]] : (byte)0);
-            }
-        }
-        leafBlockCount += nBlocks;
+        var (blockStart, nBlocks) = EmitLeaf(indices);
         nodes[nodeIdx] = new VpNode { VpIdxOrCount = nBlocks, Left = blockStart, Right = -1 };
         return nodeIdx;
     }
@@ -401,24 +449,7 @@ int BuildNode(int[] indices)
     int mid = Math.Max(1, nonVpCount / 2);
     if (mid >= nonVpCount)
     {
-        int blockStart = leafBlockCount;
-        int nBlocks    = (indices.Length + 15) / 16;
-        for (int bi = 0; bi < nBlocks; bi++)
-        {
-            for (int di = 0; di < Dims; di++)
-                for (int pos = 0; pos < 16; pos++)
-                {
-                    int mi = bi * 16 + pos;
-                    short v = mi < indices.Length ? allVecs[indices[mi] * 16 + dimOrder[di]] : PaddingSentinel;
-                    bwLB.Write(v);
-                }
-            for (int pos = 0; pos < 16; pos++)
-            {
-                int mi = bi * 16 + pos;
-                bwLL.Write(mi < indices.Length ? allLabels[indices[mi]] : (byte)0);
-            }
-        }
-        leafBlockCount += nBlocks;
+        var (blockStart, nBlocks) = EmitLeaf(indices);
         nodes[nodeIdx] = new VpNode { VpIdxOrCount = nBlocks, Left = blockStart, Right = -1 };
         return nodeIdx;
     }
